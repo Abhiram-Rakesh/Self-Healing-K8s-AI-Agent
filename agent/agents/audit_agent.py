@@ -44,7 +44,7 @@ class AuditAgent:
             "SLACK_WEBHOOK_URL", ""
         )
         self.cloudwatch_namespace = cloudwatch_namespace
-        self.aws_region = aws_region or os.environ.get("AWS_REGION", "us-east-1")
+        self.aws_region = aws_region or os.environ.get("AWS_REGION", "ap-south-1")
         self._cw = None
         if _HAS_BOTO3 and os.environ.get("KUBERNETES_SERVICE_HOST"):
             try:

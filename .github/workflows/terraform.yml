@@ -13,7 +13,7 @@ permissions:
   pull-requests: write
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: ap-south-1
   TF_VERSION: 1.7.5
   TF_WORKING_DIR: terraform
 

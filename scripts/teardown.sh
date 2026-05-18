@@ -17,7 +17,7 @@ die()  { printf "%s[  err   ]%s %s\n" "$RED" "$NC" "$*" >&2; exit 1; }
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TF_DIR="${TF_DIR:-$REPO_ROOT/terraform}"
-AWS_REGION="${AWS_REGION:-us-east-1}"
+AWS_REGION="${AWS_REGION:-ap-south-1}"
 CONFIRM_PHRASE="yes I want to destroy everything"
 
 read -r -p "Type exactly: \"$CONFIRM_PHRASE\" to proceed > " RESPONSE

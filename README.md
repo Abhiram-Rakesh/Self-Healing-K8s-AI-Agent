@@ -270,13 +270,14 @@ Resolving deltas: 100% (.../...), done.
 ### Step 2 — Create the Terraform state bucket and lock table
 
 ```bash
-export AWS_REGION=us-east-1
+export AWS_REGION=ap-south-1
 export TF_STATE_BUCKET="my-name-tf-state-$(aws sts get-caller-identity --query Account --output text)"
 
 # Create the S3 bucket with versioning + encryption.
 aws s3api create-bucket \
   --bucket "$TF_STATE_BUCKET" \
-  --region "$AWS_REGION"
+  --region "$AWS_REGION" \
+  --create-bucket-configuration LocationConstraint="$AWS_REGION"
 
 aws s3api put-bucket-versioning \
   --bucket "$TF_STATE_BUCKET" \
@@ -311,8 +312,8 @@ Expected output:
 
 **Success indicator:** Bucket appears in `aws s3 ls` and DynamoDB table status is `ACTIVE`.
 
-> **us-east-1 quirk:** Do **not** pass `--create-bucket-configuration` when the
-> region is `us-east-1`. The AWS CLI rejects `LocationConstraint=us-east-1`.
+> **ap-south-1 note:** Always pass `--create-bucket-configuration LocationConstraint=ap-south-1`
+> when creating the S3 bucket. Unlike `us-east-1`, all other regions require this flag.
 
 ### Step 3 — Configure and provision infrastructure
 
@@ -325,7 +326,7 @@ Open `terraform/terraform.tfvars` and set these values:
 
 | Variable             | Example                                  | Notes                                                    |
 |----------------------|------------------------------------------|----------------------------------------------------------|
-| `aws_region`         | `us-east-1`                              | Match the region you used in Step 2                      |
+| `aws_region`         | `ap-south-1`                              | Match the region you used in Step 2                      |
 | `cluster_name`       | `self-healing-cluster`                   | Becomes the EKS cluster name                             |
 | `cluster_version`    | `1.32`                                   | Pinned to match the kubectl version                      |
 | `environment`        | `dev`                                    | `dev` keeps NAT GW at 1 by default — cheaper             |
@@ -357,13 +358,13 @@ Apply complete! Resources: 47 added, 0 changed, 0 destroyed.
 Outputs:
 
 aws_account_id = "123456789012"
-aws_region = "us-east-1"
-cluster_endpoint = "https://EXAMPLE.gr7.us-east-1.eks.amazonaws.com"
+aws_region = "ap-south-1"
+cluster_endpoint = "https://EXAMPLE.gr7.ap-south-1.eks.amazonaws.com"
 cluster_name = "self-healing-cluster"
-ecr_repository_url = "123456789012.dkr.ecr.us-east-1.amazonaws.com/kagent-healer"
-gemini_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:kagent/gemini-api-key-AbCdEf"
+ecr_repository_url = "123456789012.dkr.ecr.ap-south-1.amazonaws.com/kagent-healer"
+gemini_secret_arn = "arn:aws:secretsmanager:ap-south-1:123456789012:secret:kagent/gemini-api-key-AbCdEf"
 kagent_irsa_role_arn = "arn:aws:iam::123456789012:role/kagent-healer-irsa"
-kubeconfig_command = "aws eks update-kubeconfig --region us-east-1 --name self-healing-cluster"
+kubeconfig_command = "aws eks update-kubeconfig --region ap-south-1 --name self-healing-cluster"
 private_subnet_ids = ["subnet-aaa", "subnet-bbb", "subnet-ccc"]
 public_subnet_ids = ["subnet-xxx", "subnet-yyy", "subnet-zzz"]
 vpc_id = "vpc-0abcdef0123456789"
@@ -389,10 +390,10 @@ kubectl get nodes
 Expected output:
 ```
 NAME                                            STATUS   ROLES    AGE   VERSION
-ip-10-0-1-12.us-east-1.compute.internal         Ready    <none>   3m    v1.32.0-eks-...
-ip-10-0-2-45.us-east-1.compute.internal         Ready    <none>   3m    v1.32.0-eks-...
-ip-10-0-3-78.us-east-1.compute.internal         Ready    <none>   3m    v1.32.0-eks-...
-ip-10-0-1-90.us-east-1.compute.internal         Ready    <none>   3m    v1.32.0-eks-...
+ip-10-0-1-12.ap-south-1.compute.internal         Ready    <none>   3m    v1.32.0-eks-...
+ip-10-0-2-45.ap-south-1.compute.internal         Ready    <none>   3m    v1.32.0-eks-...
+ip-10-0-3-78.ap-south-1.compute.internal         Ready    <none>   3m    v1.32.0-eks-...
+ip-10-0-1-90.ap-south-1.compute.internal         Ready    <none>   3m    v1.32.0-eks-...
 ```
 
 **Success indicator:** All nodes show `STATUS=Ready` and run version `v1.32.x`.
@@ -410,7 +411,7 @@ kubectl top nodes
 Expected output:
 ```
 NAME                                       CPU(cores)   CPU%   MEMORY(bytes)   MEMORY%
-ip-10-0-1-12.us-east-1.compute.internal    47m          2%     412Mi           12%
+ip-10-0-1-12.ap-south-1.compute.internal    47m          2%     412Mi           12%
 ...
 ```
 
@@ -513,7 +514,7 @@ aws secretsmanager put-secret-value \
 Expected output:
 ```
 {
-    "ARN": "arn:aws:secretsmanager:us-east-1:123456789012:secret:kagent/gemini-api-key-AbCdEf",
+    "ARN": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:kagent/gemini-api-key-AbCdEf",
     "Name": "kagent/gemini-api-key",
     "VersionId": "...",
     "VersionStages": ["AWSCURRENT"]
@@ -704,7 +705,7 @@ the action Gemini suggests (see [`agent/gemini_client.py`](agent/gemini_client.p
 | `MEMORY_DB_PATH`        | `agent.memoryDbPath`                | SQLite file for the incident memory                                  | `/tmp/kagent-memory.db`       | no                |
 | `AUDIT_LOG_PATH`        | `agent.auditLogPath`                | JSONL audit log path                                                 | `/tmp/kagent-audit.jsonl`     | no                |
 | `LOG_LEVEL`             | `agent.logLevel`                    | Python log level                                                     | `INFO`                        | no                |
-| `SECRETS_MANAGER_REGION`| `agent.secretsManagerRegion`        | Region used by boto3 at startup                                      | `us-east-1`                   | no                |
+| `SECRETS_MANAGER_REGION`| `agent.secretsManagerRegion`        | Region used by boto3 at startup                                      | `ap-south-1`                   | no                |
 | `GEMINI_API_KEY_SECRET` | `agent.geminiApiKeySecret`          | Secrets Manager ID for the Gemini key                                | `kagent/gemini-api-key`       | no                |
 | `SLACK_WEBHOOK_SECRET`  | `agent.slackWebhookSecret`          | Secrets Manager ID for the Slack URL (optional)                      | `kagent/slack-webhook`        | no                |
 | `WEBHOOK_PORT`          | `service.webhookPort`               | HTTP port for the Alertmanager webhook                               | `8000`                        | no                |
@@ -824,7 +825,7 @@ kubectl rollout status deployment/kagent-healer -n kagent
 aws secretsmanager put-secret-value \
   --secret-id kagent/gemini-api-key \
   --secret-string "new-gemini-key" \
-  --region us-east-1
+  --region ap-south-1
 
 # Force the pod to re-read the secret (it's read on startup).
 kubectl rollout restart deployment/kagent-healer -n kagent
@@ -863,7 +864,7 @@ at startup when boto3 cannot fetch the secret.
 Fix:
 ```bash
 # Confirm the secret exists and is readable.
-aws secretsmanager get-secret-value --secret-id kagent/gemini-api-key --region us-east-1
+aws secretsmanager get-secret-value --secret-id kagent/gemini-api-key --region ap-south-1
 
 # Confirm the ServiceAccount is annotated with the IRSA role ARN.
 kubectl get sa -n kagent kagent-healer -o yaml | grep eks.amazonaws.com/role-arn
@@ -934,10 +935,10 @@ Symptom: `kubectl logs -n default crash-test-...` returns
 That's a kubelet-to-control-plane port-10250 reachability issue, usually due to
 the worker security group missing an inbound rule on 10250. Fix:
 ```bash
-SG=$(aws eks describe-cluster --name self-healing-cluster --region us-east-1 \
+SG=$(aws eks describe-cluster --name self-healing-cluster --region ap-south-1 \
   --query 'cluster.resourcesVpcConfig.clusterSecurityGroupId' --output text)
 aws ec2 authorize-security-group-ingress --group-id "$SG" \
-  --protocol tcp --port 10250 --source-group "$SG" --region us-east-1
+  --protocol tcp --port 10250 --source-group "$SG" --region ap-south-1
 ```
 
 ### 6. `DRY_RUN=false` but no actions are executing
@@ -963,7 +964,7 @@ curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=YOUR_KEY" |
 
 # Then rotate (Step 6) and restart the agent
 aws secretsmanager put-secret-value --secret-id kagent/gemini-api-key \
-  --secret-string "new-key" --region us-east-1
+  --secret-string "new-key" --region ap-south-1
 kubectl rollout restart deployment/kagent-healer -n kagent
 ```
 
@@ -974,11 +975,11 @@ Symptom: `docker push ... no basic auth credentials`.
 Fix:
 ```bash
 # Confirm IAM identity is allowed to push
-aws ecr get-authorization-token --region us-east-1 >/dev/null \
+aws ecr get-authorization-token --region ap-south-1 >/dev/null \
   && echo "OK: ECR auth works"
 
 # Re-login and retry
-aws ecr get-login-password --region us-east-1 | \
+aws ecr get-login-password --region ap-south-1 | \
   docker login --username AWS --password-stdin "${ECR_URL}"
 docker push "${ECR_URL}:latest"
 ```
@@ -1018,11 +1019,11 @@ recovery commands:
 ```bash
 # List remaining LBs in the VPC
 VPC_ID=$(terraform -chdir=terraform output -raw vpc_id)
-aws elbv2 describe-load-balancers --region us-east-1 \
+aws elbv2 describe-load-balancers --region ap-south-1 \
   --query "LoadBalancers[?VpcId=='${VPC_ID}'].LoadBalancerArn" --output text
 
 # Delete each one manually then re-run terraform destroy
-aws elbv2 delete-load-balancer --region us-east-1 --load-balancer-arn <ARN>
+aws elbv2 delete-load-balancer --region ap-south-1 --load-balancer-arn <ARN>
 sleep 60
 terraform -chdir=terraform destroy
 ```

@@ -1,6 +1,6 @@
 # Copy to terraform.tfvars and fill in real values. Never commit terraform.tfvars.
 
-aws_region          = "us-east-1"
+aws_region          = "ap-south-1"
 cluster_name        = "self-healing-cluster"
 cluster_version     = "1.32"
 environment         = "dev"

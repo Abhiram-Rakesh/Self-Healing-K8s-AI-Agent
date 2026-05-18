@@ -62,7 +62,7 @@ def _load_secrets_from_aws() -> None:
         return
 
     region = os.environ.get("SECRETS_MANAGER_REGION") or os.environ.get(
-        "AWS_REGION", "us-east-1"
+        "AWS_REGION", "ap-south-1"
     )
     try:
         sm = boto3.client("secretsmanager", region_name=region)
