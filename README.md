@@ -31,7 +31,7 @@ flowchart LR
 |------------------|----------------------------------|---------------------------------------------------------------|
 | Infrastructure   | AWS EKS, VPC, ECR, Secrets Mgr   | Managed Kubernetes + image registry + secret store            |
 | IaC              | Terraform 1.10+, S3 native locking  | Reproducible cluster provisioning (no DynamoDB needed)     |
-| Observability    | kube-prometheus-stack + Grafana  | Metrics, alerting, dashboards                                 |
+| Observability    | kube-prometheus-stack, Loki, Grafana | Metrics, logs, alerting, dashboards                       |
 | Chaos            | Litmus ChaosCenter               | Repeatable failure injection                                  |
 | AI               | Google Gemini 2.5 Flash          | LLM diagnosis + remediation plan                              |
 | Agent framework  | KAgent                           | Agent runtime / multi-stage pipeline                          |
@@ -419,7 +419,45 @@ prometheus-monitoring-kube-prometheus-prometheus-0       2/2     Running   0    
 
 **Success indicator:** Every monitoring pod is `Running` with no `RESTARTS`.
 
-#### 5c — Litmus ChaosCenter
+#### 5c — Loki + Promtail
+
+Loki ships pod logs to Grafana so the **"Recent healing events"** dashboard panel
+and the log-based alert rules work. Promtail runs as a DaemonSet and tails every
+node's container logs.
+
+```bash
+helm repo add grafana https://grafana.github.io/helm-charts
+helm repo update
+
+helm upgrade --install loki grafana/loki-stack \
+  --namespace monitoring --create-namespace \
+  -f helm/loki/values.yaml --wait
+```
+
+Apply the datasource ConfigMap so Grafana's sidecar auto-provisions Loki — no
+manual datasource setup needed:
+
+```bash
+kubectl apply -f k8s/monitoring/loki-datasource.yaml
+```
+
+Verify:
+```bash
+kubectl get pods -n monitoring | grep loki
+```
+
+Expected output:
+```
+loki-0                             1/1     Running   0          90s
+loki-promtail-abcd1                1/1     Running   0          90s
+loki-promtail-abcd2                1/1     Running   0          90s
+loki-promtail-abcd3                1/1     Running   0          90s
+```
+
+**Success indicator:** `loki-0` is `Running` and one `loki-promtail-*` pod exists
+per node. In Grafana → Configuration → Data sources you should see **Loki** listed.
+
+#### 5d — Litmus ChaosCenter
 
 ```bash
 helm repo add litmuschaos https://litmuschaos.github.io/litmus-helm/
@@ -437,7 +475,7 @@ kubectl get pods -n litmus
 
 **Success indicator:** Litmus frontend / backend / mongo pods all show `Running`.
 
-#### 5d — KAgent
+#### 5e — KAgent
 
 ```bash
 helm repo add kagent https://kagent-dev.github.io/kagent
@@ -506,6 +544,7 @@ aws secretsmanager get-secret-value \
 ```bash
 kubectl apply -f k8s/monitoring/alert-rules.yaml
 kubectl apply -f k8s/monitoring/alertmanager-config.yaml
+kubectl apply -f k8s/monitoring/loki-datasource.yaml
 kubectl apply -f k8s/monitoring/grafana-dashboard-configmap.yaml
 
 kubectl get prometheusrule -n monitoring
