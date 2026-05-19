@@ -2,69 +2,85 @@ sequenceDiagram
     autonumber
     participant AM as Alertmanager
     participant OP as Operator
-    participant WH as Webhook Server (:8000)
-    participant TR as TriageAgent
-    participant CB as ContextBuilder
-    participant MEM as RunbookMemory (SQLite)
+    participant WH as WebhookServer (:8000)
+    participant PL as pipeline.run()
     participant CG as CostGuard
     participant GC as GeminiClient
-    participant AS as ApprovalStore
-    participant RM as Remediator
-    participant AU as AuditAgent
+    participant MCP as MCPServer (mcp_server.py)
     participant K as Kubernetes API
+    participant DB as SQLite (incidents)
     participant SL as Slack / CloudWatch
 
     AM->>WH: POST /webhook {alerts:[...]}
-    WH-->>AM: 200 (async processing)
+    WH-->>AM: 200 (async — thread spawned)
 
     alt status == "resolved"
-        WH->>RM: scale_down_if_tracked(alert_key)
-        RM->>K: patch deployment (restore original replicas)
+        WH->>PL: run(alert)
+        PL->>MCP: scale_down_if_resolved(alert_key)
+        MCP->>K: patch deployment (restore original replicas)
     else status == "firing"
-        WH->>TR: triage(alert)
-        alt duplicate within TTL
-            TR-->>WH: None (drop)
+        WH->>PL: run(alert) [daemon thread]
+        PL->>PL: triage(alert) — dedup check
+        alt duplicate within TTL (300s)
+            PL-->>WH: drop — return
         else new alert
-            TR->>CB: build(alert)
-            CB->>K: pod logs / events / describe / node conditions
-            CB->>K: ownerRef chain: Pod → ReplicaSet → Deployment
-            K-->>CB: context data (partial on error)
-            CB-->>TR: context dict (incl. deployment_name)
-            TR->>MEM: recall(alert_type)
-            MEM-->>TR: past cases
-            TR->>CG: check_and_increment()
+            PL->>CG: check_and_increment()
             alt budget exhausted
-                CG-->>TR: False → notify_only plan
+                CG-->>PL: False — skip
             else budget ok
-                CG-->>TR: True
-                TR->>GC: diagnose(context, past_cases)
-                GC-->>TR: plan {action, target, confidence}
-            end
-            TR->>RM: execute(plan)
-            alt confidence < threshold or protected namespace
-                RM-->>TR: executed=false
-            else dry_run=true
-                RM-->>TR: executed=true (dry_run)
-            else cordon_node / drain_node
-                RM->>AS: register(action_id) → Event
-                RM->>SL: Slack HITL request + POST /approve/<id>
-                alt operator approves before timeout
-                    OP->>WH: POST /approve/<id>
-                    WH->>AS: approve(action_id)
-                    AS-->>RM: event.set()
-                else APPROVAL_TIMEOUT_SECONDS elapsed
-                    Note over RM: auto-approve
+                CG-->>PL: True
+                PL->>GC: diagnose(triage_result)
+                Note over GC: Build GenerateContentConfig<br/>with ALL_DECLARATIONS tools
+                GC->>GC: Gemini API call #1
+
+                loop MCP tool-calling (up to GEMINI_MAX_TURNS=8)
+                    GC->>MCP: get_pod_events(namespace, pod)
+                    MCP->>K: list_namespaced_event
+                    K-->>MCP: events list
+                    MCP-->>GC: JSON sorted newest-first
+
+                    GC->>MCP: get_pod_logs(namespace, pod)
+                    MCP->>K: read_namespaced_pod_log (previous=True first)
+                    K-->>MCP: log lines
+                    MCP-->>GC: [previous] or [current] logs
+
+                    opt if more evidence needed
+                        GC->>MCP: describe_pod / get_node_conditions / recall_past_cases / resolve_deployment
+                        MCP->>K: K8s API call or SQLite read
+                        K-->>MCP: data
+                        MCP-->>GC: structured result
+                    end
+
+                    alt confidence >= 0.75
+                        Note over MCP: Safety gates inside write tool:<br/>1. confidence gate<br/>2. protected-namespace gate<br/>3. dry-run gate
+                        GC->>MCP: restart_deployment / scale_deployment (write tool)
+                        MCP->>K: patch_namespaced_deployment / scale
+                        K-->>MCP: ok / api error
+                        MCP-->>GC: "Restarted deployment/X" or "DRY_RUN: …"
+                    else cordon_node / drain_node (HITL path)
+                        GC->>MCP: cordon_node / drain_node
+                        MCP->>MCP: ApprovalStore.register(action_id)
+                        MCP->>SL: Slack HITL request + /approve/<id> URL
+                        alt operator approves before timeout
+                            OP->>WH: POST /approve/<action_id>
+                            WH->>MCP: approval_store.approve(action_id)
+                            MCP-->>WH: event.set() → True
+                        else APPROVAL_TIMEOUT_SECONDS elapsed
+                            Note over MCP: auto-approve (event.wait timeout)
+                        end
+                        MCP->>K: patch_node unschedulable + evict pods (PDB retry 5s→15s→30s)
+                        K-->>MCP: ok / api error
+                        MCP-->>GC: drain/cordon result
+                    end
+
+                    GC->>MCP: record_outcome(...) — FINAL tool call
+                    Note over GC,MCP: record_outcome captured — loop breaks
+                    MCP->>DB: INSERT INTO incidents
+                    MCP->>SL: POST Slack + CloudWatch put_metric_data
+                    MCP-->>GC: {"status": "recorded"}
                 end
-                RM->>K: cordon / evict pods (PDB retry 5s→15s→30s)
-                K-->>RM: ok / api error
-                RM-->>TR: executed=true/false
-            else restart_pod / scale_up
-                RM->>K: patch deployment / scale replicas
-                K-->>RM: ok / api error
-                RM-->>TR: executed=true/false
+
+                GC-->>PL: result dict {action, confidence, executed, ...}
             end
-            TR->>AU: record(triage, plan, result)
-            AU->>SL: audit notification + CloudWatch metric
-            AU->>MEM: store(incident)
         end
     end

@@ -21,13 +21,13 @@ flowchart LR
     subgraph K8s["AWS EKS Cluster"]
         P[Workload Pods] -->|metrics| PR[Prometheus]
         PR -->|alerts fire| AM[Alertmanager]
-        AM -->|webhook| AG[kagent-healer Agent]
-        AG -->|read logs / events / pod spec| K8sAPI[Kubernetes API]
-        AG -->|patch deployment / cordon node| K8sAPI
+        AM -->|webhook| AG[kagent-healer\nMCP Server + Gemini tool-calling loop]
+        AG -->|MCP read tools: logs / events / pod spec| K8sAPI[Kubernetes API]
+        AG -->|MCP write tools: restart / scale / cordon / drain| K8sAPI
     end
-    AG -->|diagnose| G[(Gemini 2.5 Flash)]
-    AG -->|HITL approvals + audit notifications| CW[CloudWatch + Slack]
-    AG -->|past cases| MEM[(SQLite memory)]
+    AG -->|tool-calling investigation + action| G[(Gemini 2.5 Flash)]
+    AG -->|record_outcome: audit + notify| CW[CloudWatch + Slack]
+    AG -->|recall_past_cases / record_outcome| MEM[(SQLite memory)]
 ```
 
 ---
@@ -40,9 +40,9 @@ flowchart LR
 | IaC              | Terraform 1.10+, S3 native locking  | Reproducible cluster provisioning (no DynamoDB needed)     |
 | Observability    | kube-prometheus-stack, Loki, Grafana | Metrics, logs, alerting, dashboards                       |
 | Chaos            | Litmus ChaosCenter               | Repeatable failure injection                                  |
-| AI               | Google Gemini 2.5 Flash          | LLM diagnosis + remediation plan                              |
-| Agent framework  | KAgent                           | Agent runtime / multi-stage pipeline                          |
-| Runtime          | Python 3.11 (FastAPI-style HTTP) | Webhook server, K8s client, Gemini SDK                        |
+| AI               | Google Gemini 2.5 Flash          | Drives investigation and action via MCP tool-calling loop     |
+| Agent framework  | KAgent (MCP server + Gemini loop)| All K8s I/O in `mcp_server.py`; Gemini calls tools directly  |
+| Runtime          | Python 3.11 (stdlib HTTP server) | Webhook server, K8s client, Gemini SDK                        |
 | Memory           | SQLite (stdlib)                  | Past incident store — no external DB needed                   |
 | Packaging        | Docker (multi-stage, non-root, amd64+arm64) | Reproducible agent image, runs on Graviton nodes     |
 | Deployment       | Helm v3                          | Templated K8s install of the agent                            |
@@ -665,15 +665,16 @@ kubectl logs -n kagent -l app.kubernetes.io/name=kagent-healer -f
 
 Expected agent log lines (abridged):
 ```
-2026-05-18 12:34:56 INFO agent.webhook_server | Received alert: PodCrashLooping default/crash-test-...
-2026-05-18 12:34:56 INFO agent.agents.triage_agent | Triage: accepted alert PodCrashLooping:default:crash-test-... (severity=critical weight=3)
-2026-05-18 12:34:58 INFO agent.gemini_client | Gemini diagnosis: action=restart_pod target=default/crash-test confidence=0.88
-2026-05-18 12:34:58 INFO agent.remediator | DRY_RUN: would execute action=restart_pod target=default/crash-test confidence=0.88
-2026-05-18 12:34:58 INFO agent.agents.audit_agent | AUDIT {"timestamp":"...","action":"restart_pod","executed":true,"dry_run":true,...}
+2026-05-18 12:34:56 INFO agent.server | Received 1 alert(s) from Alertmanager
+2026-05-18 12:34:56 INFO agent.pipeline | alert_key=PodCrashLooping:default:crash-test-... severity=critical weight=3
+2026-05-18 12:34:57 INFO agent.gemini | MCP tool get_pod_events          → 342 chars
+2026-05-18 12:34:57 INFO agent.gemini | MCP tool get_pod_logs            → 1024 chars
+2026-05-18 12:34:58 INFO agent.gemini | MCP tool restart_deployment      → 48 chars
+2026-05-18 12:34:58 INFO agent.mcp_server | DRY_RUN: would execute restart_deployment on default/crash-test
 ```
 
-**Success indicator:** Agent log shows `Gemini diagnosis: action=restart_pod`
-followed by an `AUDIT` line for the same alert.
+**Success indicator:** Agent log shows `MCP tool restart_deployment` followed
+by a `DRY_RUN` or `Restarted deployment/` line for the same alert.
 
 To switch to **live** healing (no dry-run), re-run the Helm command from Step 9
 with `--set agent.dryRun="false"` — see [Enabling live healing](#enabling-live-healing-dry_runfalse).
@@ -715,14 +716,14 @@ and Alertmanager.
 
 | Alert                | PromQL trigger                                                                            | Action         | Confidence needed | What happens                                                                |
 |----------------------|-------------------------------------------------------------------------------------------|----------------|-------------------|-----------------------------------------------------------------------------|
-| `PodCrashLooping`    | `rate(kube_pod_container_status_restarts_total[5m]) * 60 > 0.5` for 1m                    | `restart_pod`  | ≥ 0.75            | Patches the Deployment's `kubectl.kubernetes.io/restartedAt` annotation     |
-| `PodOOMKilled`       | `kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1`               | `restart_pod` *or* `scale_up` | ≥ 0.75 | If Gemini sees repeated OOMs across replicas, prefers `scale_up`. Replica count is restored automatically when the alert resolves. |
-| `PodPendingTooLong`  | `kube_pod_status_phase{phase="Pending"} == 1` for 5m                                      | `scale_up` *or* `notify_only` | ≥ 0.75 | Bumps replicas by 1 up to `MAX_REPLICAS` if cause is taint/resource pressure. Replica count is restored automatically when the alert resolves. |
+| `PodCrashLooping`    | `rate(kube_pod_container_status_restarts_total[5m]) * 60 > 0.5` for 1m                    | `restart_deployment`  | ≥ 0.75            | Safety gates (confidence → protected-namespace → dry-run) enforced inside the MCP write tool. Patches the Deployment's `kubectl.kubernetes.io/restartedAt` annotation. |
+| `PodOOMKilled`       | `kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1`               | `restart_deployment` *or* `scale_deployment` | ≥ 0.75 | If Gemini sees repeated OOMs across replicas, prefers `scale_deployment`. Original replica count is stored and restored automatically when the alert resolves. |
+| `PodPendingTooLong`  | `kube_pod_status_phase{phase="Pending"} == 1` for 5m                                      | `scale_deployment` *or* `notify_only` | ≥ 0.75 | Bumps replicas by 1 up to `MAX_REPLICAS` if cause is taint/resource pressure. Replica count is restored automatically when the alert resolves. |
 | `NodeNotReady`       | `kube_node_status_condition{condition="Ready",status="true"} == 0` for 2m                 | `cordon_node` *or* `drain_node` | ≥ 0.80 + HITL | Posts a Slack message with a `POST /approve/<id>` URL. Agent waits up to `APPROVAL_TIMEOUT_SECONDS` (default 300s) then auto-approves. Drain retries PDB-blocked pods with 5s→15s→30s backoff. |
 | `PVCUsageHigh`       | `kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes > 0.85` for 5m     | `notify_only`  | n/a               | Storage growth is a human decision — agent never resizes PVCs               |
 
 All confidence values below `0.70` are forced to `notify_only` regardless of
-the action Gemini suggests (see [`agent/gemini_client.py`](agent/gemini_client.py)).
+the action Gemini suggests (enforced inside each MCP write tool in `agent/mcp_server.py`).
 
 ---
 
@@ -732,6 +733,7 @@ the action Gemini suggests (see [`agent/gemini_client.py`](agent/gemini_client.p
 |-------------------------|-------------------------------------|----------------------------------------------------------------------|-------------------------------|-------------------|
 | `GEMINI_API_KEY`        | (from Secrets Manager)              | Google Gemini API key                                                | —                             | yes               |
 | `GEMINI_MODEL`          | `agent.geminiModel`                 | Gemini model to call                                                 | `gemini-2.5-flash`            | no                |
+| `GEMINI_MAX_TURNS`      | `agent.geminiMaxTurns`              | Max MCP tool-calling turns per investigation before fallback         | `8`                           | no                |
 | `DRY_RUN`               | `agent.dryRun`                      | If `true`, log actions but do not touch the cluster                  | `true`                        | no                |
 | `CONFIDENCE_THRESHOLD`  | `agent.confidenceThreshold`         | Minimum Gemini confidence to act                                     | `0.75`                        | no                |
 | `MAX_REPLICAS`          | `agent.maxReplicas`                 | Hard cap for `scale_up`                                              | `10`                          | no                |
@@ -761,13 +763,10 @@ The agent serves metrics on `:8001` (scraped by the `ServiceMonitor`).
 | `kagent_actions_total` | Counter | `action`, `executed` | Healing actions attempted |
 | `kagent_healing_seconds` | Histogram | — | End-to-end alert→resolution latency |
 | `kagent_last_confidence` | Gauge | — | Confidence score from the last Gemini response |
-| `kagent_requests_remaining_today` | Gauge | — | Remaining Gemini budget for the current UTC day |
-| `kagent_stage_duration_seconds` | Histogram | `stage` | Per-stage duration: `triage`, `diagnosis`, `remediation`, `audit` |
-| `kagent_stage_errors_total` | Counter | `stage` | Errors thrown by each pipeline stage |
+| `kagent_requests_remaining` | Gauge | — | Remaining Gemini budget for the current UTC day |
 
-The Grafana dashboard surfaces all of these across 13 panels including p50/p95
-per-stage latency, stage error rate, and a budget-remaining stat with colour
-thresholds (red < 10, yellow < 50, green ≥ 50).
+The Grafana dashboard surfaces all of these including a budget-remaining stat
+with colour thresholds (red < 10, yellow < 50, green ≥ 50).
 
 ---
 
@@ -1016,16 +1015,15 @@ prometheus-stack release was installed with
 
 Symptom: Agent logs show `action=notify_only` over and over.
 
-Diagnosis: Context builder is probably returning empty logs / events because
-the pod was already deleted by the time we tried to read it.
+Diagnosis: Gemini's MCP tools are probably returning empty logs / events because
+the pod was already deleted by the time the tool was called.
 
 ```bash
 POD=$(kubectl get pod -n kagent -l app.kubernetes.io/name=kagent-healer -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -n kagent "$POD" -- python -c "
-from agent.context_builder import ContextBuilder
-ctx = ContextBuilder().build({'labels': {'alertname':'X','namespace':'default','pod':'crash-test-abc'}})
-for k, v in ctx.items():
-    print(k, '=', repr(v)[:200])
+from agent import mcp_server
+print(mcp_server.get_pod_logs('default', 'crash-test-abc'))
+print(mcp_server.get_pod_events('default', 'crash-test-abc'))
 "
 ```
 
