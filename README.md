@@ -698,7 +698,7 @@ you're watching on screen:
    agent.
 4. **Gemini diagnosis** — tails the agent log until you see
    `Gemini diagnosis: action=...` with a real confidence score.
-5. **Healing action** — the `restart_pod` action is logged (dry-run by default).
+5. **Healing action** — the `restart_deployment` action is logged (dry-run by default).
 6. **OOM injection** — applies `oom-test.yaml`, which immediately exceeds its
    64Mi memory limit and is OOMKilled.
 7. **Litmus chaos** — runs a `pod-delete` experiment on the `demo-app`
@@ -736,7 +736,7 @@ the action Gemini suggests (enforced inside each MCP write tool in `agent/mcp_se
 | `GEMINI_MAX_TURNS`      | `agent.geminiMaxTurns`              | Max MCP tool-calling turns per investigation before fallback         | `8`                           | no                |
 | `DRY_RUN`               | `agent.dryRun`                      | If `true`, log actions but do not touch the cluster                  | `true`                        | no                |
 | `CONFIDENCE_THRESHOLD`  | `agent.confidenceThreshold`         | Minimum Gemini confidence to act                                     | `0.75`                        | no                |
-| `MAX_REPLICAS`          | `agent.maxReplicas`                 | Hard cap for `scale_up`                                              | `10`                          | no                |
+| `MAX_REPLICAS`          | `agent.maxReplicas`                 | Hard cap for `scale_deployment`                                      | `10`                          | no                |
 | `DAILY_REQUEST_LIMIT`   | `agent.dailyRequestLimit`           | Max Gemini API calls per UTC day                                     | `200`                         | no                |
 | `MEMORY_DB_PATH`        | `agent.memoryDbPath`                | SQLite file for the incident memory                                  | `/tmp/kagent-memory.db`       | no                |
 | `AUDIT_LOG_PATH`        | `agent.auditLogPath`                | JSONL audit log path                                                 | `/tmp/kagent-audit.jsonl`     | no                |
@@ -786,8 +786,8 @@ To add a new rule:
        kagent: "true"   # <-- required, so Alertmanager routes it to the healer
      annotations:
        summary: "Something happened in {{ $labels.namespace }}/{{ $labels.pod }}"
-       pod: "{{ $labels.pod }}"            # <-- required for context_builder
-       namespace: "{{ $labels.namespace }}"  # <-- required for context_builder
+       pod: "{{ $labels.pod }}"            # <-- required for MCP investigation tools
+       namespace: "{{ $labels.namespace }}"  # <-- required for MCP investigation tools
    ```
 3. Apply: `kubectl apply -f k8s/monitoring/alert-rules.yaml`.
 4. Verify in Prometheus UI (`/alerts`) and watch the agent log for the first
@@ -1061,7 +1061,8 @@ aws ec2 authorize-security-group-ingress --group-id "$SG" \
 ### 6. `DRY_RUN=false` but no actions are executing
 
 Likely cause #1: the target namespace is in `PROTECTED_NAMESPACES`. Check
-[`agent/remediator.py`](agent/remediator.py).
+[`agent/mcp_server.py`](agent/mcp_server.py) — the `PROTECTED_NAMESPACES` set
+and safety gates live at the top of that file.
 
 Likely cause #2: confidence is below threshold — check the log line
 `Confidence X.XX below threshold 0.75`.
@@ -1152,7 +1153,7 @@ terraform -chdir=terraform destroy
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide — setup, code style,
 adding healing actions, adding alert rules, and the safety checklist every PR
-touching the remediator must pass.
+touching MCP tools or alert rules must pass.
 
 PRs use [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md).
 Dependencies are kept up to date automatically via

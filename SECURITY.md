@@ -34,7 +34,7 @@ crediting the reporter (unless anonymity is requested).
 | Control | Detail |
 |---------|--------|
 | Dry-run by default | `DRY_RUN=true` in `values.yaml` — no live actions without explicit opt-in |
-| Confidence gate | Remediator rejects plans below `CONFIDENCE_THRESHOLD` (default 0.75) |
+| Confidence gate | Each MCP write tool rejects calls below `CONFIDENCE_THRESHOLD` (default 0.75) |
 | Protected namespaces | `kube-system`, `monitoring`, `kagent`, and others are never touched |
 | HITL for high-impact actions | `cordon_node` / `drain_node` send a Slack notification and wait for approval |
 | Non-root container | Agent runs as UID 1000, all capabilities dropped, read-only root filesystem |

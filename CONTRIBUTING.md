@@ -51,24 +51,41 @@ mock everything at the boundary.
 
 ## Adding a new healing action
 
-1. Implement the action method in `agent/remediator.py` (`_my_action`).
-2. Wire it into `Remediator.execute()` under the action name string.
-3. If the action is high-impact (destructive or cluster-wide), add its name to
-   `REQUIRES_APPROVAL` in `agent/agents/remediation_agent.py` — the
-   `ApprovalStore` flow will handle the Slack notification and
-   `POST /approve/<id>` wait automatically.
-4. If the action scales resources **up**, store the original count in
-   `self._scale_state` (keyed by `plan.get("alert_key")`) so
-   `scale_down_if_tracked()` can reverse it when the alert resolves. See the
-   existing `scale_up` path in `Remediator.execute()` as the pattern to follow.
-5. The context dict passed to Gemini now includes `deployment_name` (resolved
-   from the pod's ownerReferences). Reference it in your system prompt
-   additions rather than relying on Gemini to infer the deployment from the pod
-   name.
-6. Add a Prometheus alert rule in `k8s/monitoring/alert-rules.yaml` that
+All healing actions are MCP tools in `agent/mcp_server.py`. Gemini decides
+which tool to call — your job is to implement the tool safely and declare it.
+
+1. **Add the tool function** to `agent/mcp_server.py`. Write tools must enforce
+   the three safety gates in this exact order before touching the cluster:
+   ```python
+   def my_action(namespace: str, target: str, confidence: float, reason: str) -> str:
+       if (msg := _confidence_gate(confidence)):   return msg
+       if (msg := _namespace_gate(namespace)):      return msg   # skip for node actions
+       if (msg := _dry_run_gate("my_action", target)): return msg
+       # ... actual K8s call ...
+       return f"Did my_action on {target}"
+   ```
+2. **For high-impact actions** (destructive or cluster-wide), add the HITL
+   approval flow inside the tool — the `ApprovalStore` pattern in `cordon_node`
+   and `drain_node` is the reference implementation. The webhook server's
+   `POST /approve/<id>` endpoint calls `mcp_server.approval_store.approve()`
+   automatically.
+3. **For scale-modifying actions**, store the original replica count in
+   `_scale_state[alert_key]` so `scale_down_if_resolved()` can restore it when
+   the alert resolves. See `scale_deployment` for the pattern.
+4. **Register it in `_DISPATCH`** so `call_tool()` can find it:
+   ```python
+   _DISPATCH["my_action"] = my_action
+   ```
+5. **Add a declaration to `ALL_DECLARATIONS`** in Gemini function-calling
+   format (JSON Schema, lowercase types). Gemini will not call the tool
+   unless it appears here.
+6. **Register with FastMCP** inside the `if _HAS_MCP and mcp is not None:` block
+   so the standalone MCP server also exposes the new tool.
+7. **Add a Prometheus alert rule** in `k8s/monitoring/alert-rules.yaml` that
    can trigger the new action.
-7. Add unit tests in `agent/tests/test_remediator.py`.
-8. Update the healing actions table in `README.md`.
+8. **Add unit tests** in `agent/tests/test_mcp_server.py` — cover at least the
+   confidence gate, namespace gate, dry-run gate, and the happy path.
+9. **Update the healing actions table** in `README.md`.
 
 ## Adding a new alert rule
 
@@ -87,13 +104,14 @@ mock everything at the boundary.
 - The CI workflow runs `terraform plan` on every PR — check the plan comment
   before merging.
 
-## Safety checklist for remediator / alert-rule changes
+## Safety checklist for MCP tool / alert-rule changes
 
 - [ ] `PROTECTED_NAMESPACES` still includes `kube-system`, `kagent`, `monitoring`
-- [ ] No new action executes without passing the confidence gate
+- [ ] All three safety gates (confidence → namespace → dry-run) are the first three lines of every write tool in `agent/mcp_server.py`
 - [ ] `DRY_RUN=true` remains the default in `helm/kagent-healer/values.yaml`
-- [ ] High-impact actions are listed in `REQUIRES_APPROVAL` (triggers the `ApprovalStore` HITL flow)
-- [ ] Scale-modifying actions store their pre-change state in `_scale_state` and are reversed by `scale_down_if_tracked()` on alert resolution
+- [ ] High-impact actions use the `ApprovalStore` HITL flow (see `cordon_node` / `drain_node`)
+- [ ] Scale-modifying actions store their pre-change state in `_scale_state` and are reversed by `scale_down_if_resolved()` on alert resolution
+- [ ] New tool is declared in `ALL_DECLARATIONS` and registered in `_DISPATCH`
 - [ ] `WEBHOOK_TOKEN` is never hardcoded — leave `agent.webhookToken` empty in `values.yaml` and inject via `extraEnv` referencing a K8s Secret in production
 
 ## Helm chart changes
@@ -111,7 +129,7 @@ Use the [Conventional Commits](https://www.conventionalcommits.org/) style:
 
 ```
 feat: add drain_node healing action
-fix: handle 429 retry in gemini_client
+fix: handle 429 retry in gemini tool-calling loop
 chore: bump python:3.11-slim base image
 docs: update README with Loki install step
 ```

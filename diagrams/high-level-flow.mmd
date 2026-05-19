@@ -2,16 +2,16 @@ flowchart LR
     subgraph K8s["AWS EKS Cluster"]
         P[Workload Pods] -->|metrics| PR[Prometheus]
         PR -->|alerts fire| AM[Alertmanager]
-        AM -->|webhook| AG[kagent-healer Agent]
-        AG -->|read logs / events / pod spec| K8sAPI[Kubernetes API]
-        AG -->|patch deployment / cordon node| K8sAPI
+        AM -->|webhook| AG[kagent-healer\nMCP Server + Gemini tool-calling loop]
+        AG -->|MCP read tools: logs / events / pod spec| K8sAPI[Kubernetes API]
+        AG -->|MCP write tools: restart / scale / cordon / drain| K8sAPI
         AG -->|metrics :8001| PR
     end
 
-    AG -->|diagnose| G[(Gemini 2.5 Flash)]
-    AG -->|HITL approvals + audit notifications| S[Slack]
-    AG -->|audit| CW[CloudWatch Metrics & Logs]
-    AG -->|past cases| MEM[(SQLite memory)]
+    AG -->|tool-calling investigation + action| G[(Gemini 2.5 Flash)]
+    AG -->|record_outcome: HITL approval + audit notify| S[Slack]
+    AG -->|record_outcome: healing metric| CW[CloudWatch Metrics & Logs]
+    AG -->|recall_past_cases / record_outcome| MEM[(SQLite memory)]
 
     classDef agent fill:#4f46e5,color:#fff,stroke:#312e81;
     classDef ai fill:#16a34a,color:#fff,stroke:#14532d;
