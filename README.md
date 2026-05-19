@@ -19,7 +19,7 @@ flowchart LR
         AG -->|patch deployment / cordon node| K8sAPI
     end
     AG -->|diagnose| G[(Gemini 2.5 Flash)]
-    AG -->|audit| CW[CloudWatch + Slack]
+    AG -->|HITL approvals + audit notifications| CW[CloudWatch + Slack]
     AG -->|past cases| MEM[(SQLite memory)]
 ```
 
@@ -603,8 +603,12 @@ helm upgrade --install kagent-healer helm/kagent-healer/ \
 ```
 
 For production clusters, overlay `values-prod.yaml` which enables live healing,
-higher confidence threshold (0.80), HPA, PodDisruptionBudget, NetworkPolicy, and
-**persistent storage** for the incident memory and audit log (survives pod restarts):
+higher confidence threshold (0.80), PodDisruptionBudget, NetworkPolicy, and
+**persistent storage** for the incident memory and audit log (survives pod restarts).
+HPA is intentionally disabled in this overlay — SQLite does not support concurrent
+writes from multiple pods sharing a `ReadWriteOnce` PVC, so `replicaCount` is
+kept at 1. To run multiple replicas, replace the SQLite memory backend with a
+shared database and set `persistence.enabled=false`.
 
 ```bash
 helm upgrade --install kagent-healer helm/kagent-healer/ \
