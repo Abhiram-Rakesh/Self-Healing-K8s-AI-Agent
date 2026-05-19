@@ -29,6 +29,18 @@ agent:
   geminiApiKeySecret: "kagent/gemini-api-key"
   slackWebhookSecret: "kagent/slack-webhook"
   geminiModel: "gemini-2.5-flash"
+  # Set to secure the /webhook endpoint with Bearer-token auth.
+  # Production: inject via extraEnv referencing a K8s Secret instead.
+  webhookToken: ""
+  # External base URL of this service, used to build the /approve/<id> URL in Slack messages.
+  # Example: "http://kagent-healer.kagent.svc.cluster.local:8000"
+  webhookBaseUrl: ""
+
+persistence:
+  enabled: false
+  size: 1Gi
+  storageClass: ""
+  accessMode: ReadWriteOnce
 
 podAnnotations:
   prometheus.io/scrape: "true"

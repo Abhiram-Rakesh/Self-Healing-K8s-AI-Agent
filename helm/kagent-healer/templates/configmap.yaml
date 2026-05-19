@@ -10,8 +10,13 @@ data:
   CONFIDENCE_THRESHOLD: {{ .Values.agent.confidenceThreshold | quote }}
   MAX_REPLICAS: {{ .Values.agent.maxReplicas | quote }}
   DAILY_REQUEST_LIMIT: {{ .Values.agent.dailyRequestLimit | quote }}
+  {{- if .Values.persistence.enabled }}
+  MEMORY_DB_PATH: "/data/kagent-memory.db"
+  AUDIT_LOG_PATH: "/data/kagent-audit.jsonl"
+  {{- else }}
   MEMORY_DB_PATH: {{ .Values.agent.memoryDbPath | quote }}
   AUDIT_LOG_PATH: {{ .Values.agent.auditLogPath | quote }}
+  {{- end }}
   LOG_LEVEL: {{ .Values.agent.logLevel | quote }}
   SECRETS_MANAGER_REGION: {{ .Values.agent.secretsManagerRegion | quote }}
   GEMINI_API_KEY_SECRET: {{ .Values.agent.geminiApiKeySecret | quote }}
@@ -19,4 +24,6 @@ data:
   GEMINI_MODEL: {{ .Values.agent.geminiModel | quote }}
   WEBHOOK_PORT: {{ .Values.service.webhookPort | quote }}
   METRICS_PORT: {{ .Values.service.metricsPort | quote }}
+  WEBHOOK_TOKEN: {{ .Values.agent.webhookToken | default "" | quote }}
+  WEBHOOK_BASE_URL: {{ .Values.agent.webhookBaseUrl | default "" | quote }}
   PYTHONDONTWRITEBYTECODE: "1"

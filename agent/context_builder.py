@@ -34,6 +34,7 @@ class ContextBuilder:
 
     def __init__(self) -> None:
         self._core: Any = None
+        self._apps: Any = None
         self._configured = False
         self._configure()
 
@@ -53,9 +54,10 @@ class ContextBuilder:
                 return
         try:
             self._core = k8s_client.CoreV1Api()
+            self._apps = k8s_client.AppsV1Api()
             self._configured = True
         except Exception as exc:
-            logger.error("Failed to construct CoreV1Api: %s", exc)
+            logger.error("Failed to construct K8s API clients: %s", exc)
 
     @staticmethod
     def _alert_labels(alert: dict[str, Any]) -> dict[str, str]:
@@ -186,6 +188,28 @@ class ContextBuilder:
         except Exception as exc:
             return _unavailable(str(exc))
 
+    def _resolve_deployment(self, namespace: str, pod: str) -> str:
+        """Walk ownerReferences: Pod → ReplicaSet → Deployment."""
+        if not self._configured or not pod or not namespace:
+            return ""
+        try:
+            p = self._core.read_namespaced_pod(name=pod, namespace=namespace)
+            rs_name = ""
+            for ref in (p.metadata.owner_references or []):
+                if getattr(ref, "kind", "") == "ReplicaSet":
+                    rs_name = str(ref.name)
+                    break
+            if not rs_name:
+                return ""
+            rs = self._apps.read_namespaced_replica_set(name=rs_name, namespace=namespace)
+            for ref in (rs.metadata.owner_references or []):
+                if getattr(ref, "kind", "") == "Deployment":
+                    return str(ref.name)
+            return ""
+        except Exception as exc:
+            logger.debug("pod→deployment resolution failed for %s/%s: %s", namespace, pod, exc)
+            return ""
+
     def build(self, alert: dict[str, Any]) -> dict[str, Any]:
         """Return a context dict; every field handles its own errors."""
         labels = self._alert_labels(alert)
@@ -200,6 +224,8 @@ class ContextBuilder:
         node_name = ""
         if isinstance(pod_describe, dict):
             node_name = str(pod_describe.get("node", ""))
+
+        deployment_name = self._resolve_deployment(namespace, pod)
 
         try:
             pod_logs = self._fetch_pod_logs(namespace, pod)
@@ -222,6 +248,7 @@ class ContextBuilder:
             "severity": severity,
             "pod_name": pod,
             "namespace": namespace,
+            "deployment_name": deployment_name,
             "node_name": node_name,
             "pod_logs": pod_logs,
             "k8s_events": events,

@@ -603,7 +603,8 @@ helm upgrade --install kagent-healer helm/kagent-healer/ \
 ```
 
 For production clusters, overlay `values-prod.yaml` which enables live healing,
-higher confidence threshold (0.80), HPA, PodDisruptionBudget, and NetworkPolicy:
+higher confidence threshold (0.80), HPA, PodDisruptionBudget, NetworkPolicy, and
+**persistent storage** for the incident memory and audit log (survives pod restarts):
 
 ```bash
 helm upgrade --install kagent-healer helm/kagent-healer/ \
@@ -704,9 +705,9 @@ and Alertmanager.
 | Alert                | PromQL trigger                                                                            | Action         | Confidence needed | What happens                                                                |
 |----------------------|-------------------------------------------------------------------------------------------|----------------|-------------------|-----------------------------------------------------------------------------|
 | `PodCrashLooping`    | `rate(kube_pod_container_status_restarts_total[5m]) * 60 > 0.5` for 1m                    | `restart_pod`  | ≥ 0.75            | Patches the Deployment's `kubectl.kubernetes.io/restartedAt` annotation     |
-| `PodOOMKilled`       | `kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1`               | `restart_pod` *or* `scale_up` | ≥ 0.75 | If Gemini sees repeated OOMs across replicas, prefers `scale_up`            |
-| `PodPendingTooLong`  | `kube_pod_status_phase{phase="Pending"} == 1` for 5m                                      | `scale_up` *or* `notify_only` | ≥ 0.75 | Bumps replicas by 1 up to `MAX_REPLICAS` if cause is taint/resource pressure |
-| `NodeNotReady`       | `kube_node_status_condition{condition="Ready",status="true"} == 0` for 2m                 | `cordon_node` *or* `drain_node` | ≥ 0.80 + HITL | Slack approval required; drain evicts all non-DaemonSet pods (respects PDBs) |
+| `PodOOMKilled`       | `kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1`               | `restart_pod` *or* `scale_up` | ≥ 0.75 | If Gemini sees repeated OOMs across replicas, prefers `scale_up`. Replica count is restored automatically when the alert resolves. |
+| `PodPendingTooLong`  | `kube_pod_status_phase{phase="Pending"} == 1` for 5m                                      | `scale_up` *or* `notify_only` | ≥ 0.75 | Bumps replicas by 1 up to `MAX_REPLICAS` if cause is taint/resource pressure. Replica count is restored automatically when the alert resolves. |
+| `NodeNotReady`       | `kube_node_status_condition{condition="Ready",status="true"} == 0` for 2m                 | `cordon_node` *or* `drain_node` | ≥ 0.80 + HITL | Posts a Slack message with a `POST /approve/<id>` URL. Agent waits up to `APPROVAL_TIMEOUT_SECONDS` (default 300s) then auto-approves. Drain retries PDB-blocked pods with 5s→15s→30s backoff. |
 | `PVCUsageHigh`       | `kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes > 0.85` for 5m     | `notify_only`  | n/a               | Storage growth is a human decision — agent never resizes PVCs               |
 
 All confidence values below `0.70` are forced to `notify_only` regardless of
@@ -732,6 +733,9 @@ the action Gemini suggests (see [`agent/gemini_client.py`](agent/gemini_client.p
 | `SLACK_WEBHOOK_SECRET`  | `agent.slackWebhookSecret`          | Secrets Manager ID for the Slack URL (optional)                      | `kagent/slack-webhook`        | no                |
 | `WEBHOOK_PORT`          | `service.webhookPort`               | HTTP port for the Alertmanager webhook                               | `8000`                        | no                |
 | `METRICS_PORT`          | `service.metricsPort`               | Prometheus metrics port                                              | `8001`                        | no                |
+| `WEBHOOK_TOKEN`         | `agent.webhookToken`                | If set, `POST /webhook` requires `Authorization: Bearer <token>`. Set via `extraEnv` + a K8s Secret in production. | `""` | no |
+| `WEBHOOK_BASE_URL`      | `agent.webhookBaseUrl`              | External base URL of this service, used to build the clickable `POST /approve/<id>` link in Slack HITL messages. Example: `http://kagent-healer.kagent.svc.cluster.local:8000` | `""` | no |
+| `APPROVAL_TIMEOUT_SECONDS` | —                                | Seconds the agent waits for a human to approve `cordon_node`/`drain_node` before auto-approving | `300` | no |
 
 ---
 
@@ -864,6 +868,31 @@ This starts six tunnels simultaneously:
 Press `Ctrl-C` to stop all tunnels. Logs for each forward are written to
 `/tmp/kagent-portforward/`.
 
+### Approve a pending high-impact action (HITL)
+
+When the agent diagnoses a `NodeNotReady` alert and decides on `cordon_node` or
+`drain_node`, it posts a Slack message and waits up to `APPROVAL_TIMEOUT_SECONDS`
+(default 5 minutes) for a human to approve before auto-proceeding.
+
+To approve explicitly, `POST` to the `/approve/<action_id>` endpoint printed in
+the Slack message. Via port-forward:
+
+```bash
+kubectl -n kagent port-forward svc/kagent-healer 8000:8000 &
+curl -X POST http://localhost:8000/approve/<action_id>
+# {"approved":"<action_id>"}
+kill %1 2>/dev/null
+```
+
+If `WEBHOOK_BASE_URL` is configured, the Slack message includes the full URL
+so you can approve directly from Slack without a port-forward.
+
+To list pending approvals (check agent logs for `action_id=` lines):
+```bash
+kubectl logs -n kagent -l app.kubernetes.io/name=kagent-healer --tail=50 \
+  | grep "Awaiting approval"
+```
+
 ### View agent logs
 
 ```bash
@@ -874,8 +903,13 @@ kubectl logs -n kagent -l app.kubernetes.io/name=kagent-healer --tail=200 -f
 
 ```bash
 POD=$(kubectl get pod -n kagent -l app.kubernetes.io/name=kagent-healer -o jsonpath='{.items[0].metadata.name}')
-kubectl exec -n kagent "$POD" -- cat /tmp/kagent-audit.jsonl | jq -r '.'
+kubectl exec -n kagent "$POD" -- cat /data/kagent-audit.jsonl | jq -r '.'
 ```
+
+> **Note:** With `persistence.enabled=true` (the production default), the audit
+> log lives at `/data/kagent-audit.jsonl` inside the pod and survives restarts.
+> With the development default (`persistence.enabled=false`) it is at
+> `/tmp/kagent-audit.jsonl` and is reset on every pod restart.
 
 ### Manually test the healing loop
 

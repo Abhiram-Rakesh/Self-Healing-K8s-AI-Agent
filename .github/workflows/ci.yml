@@ -35,7 +35,7 @@ jobs:
       - name: black --check
         run: black --check agent/
       - name: mypy
-        run: mypy agent/ --ignore-missing-imports || true
+        run: mypy agent/ --ignore-missing-imports
 
   test:
     name: Test (pytest + coverage)

@@ -11,6 +11,7 @@ import sys
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 from agent.agents import (
+    ApprovalStore,
     AuditAgent,
     DiagnosisAgent,
     RemediationAgent,
@@ -145,12 +146,13 @@ def main() -> int:
     gemini = GeminiClient()
     context_builder = ContextBuilder()
     remediator = Remediator()
+    approval_store = ApprovalStore()
 
     metrics = _build_metrics(cost_guard)
 
     triage = TriageAgent()
     diagnosis = DiagnosisAgent(gemini, context_builder, memory, cost_guard)
-    remediation = RemediationAgent(remediator)
+    remediation = RemediationAgent(remediator, approval_store=approval_store)
     audit = AuditAgent(memory=memory)
 
     pipeline = HealingPipeline(triage, diagnosis, remediation, audit, metrics=metrics)
@@ -158,7 +160,7 @@ def main() -> int:
     start_http_server(metrics_port)
     logger.info("Prometheus metrics server listening on :%d", metrics_port)
 
-    server = WebhookServer(pipeline, port=webhook_port)
+    server = WebhookServer(pipeline, port=webhook_port, approval_store=approval_store)
     try:
         server.start()
     except KeyboardInterrupt:

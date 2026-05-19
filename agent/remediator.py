@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -86,6 +88,9 @@ class Remediator:
         self._apps: Any = None
         self._core: Any = None
         self._configured = False
+        # alert_key → (namespace, deployment, original_replicas) for scale-down on resolution
+        self._scale_state: dict[str, tuple[str, str, int]] = {}
+        self._scale_lock = threading.Lock()
         self._configure()
 
     def _configure(self) -> None:
@@ -126,23 +131,57 @@ class Remediator:
             name=deployment, namespace=namespace, body=patch
         )
 
-    def _scale_up(self, namespace: str, deployment: str) -> int:
+    def _scale_up(self, namespace: str, deployment: str) -> tuple[int, int]:
+        """Return (original_replicas, new_replicas)."""
         dep = self._apps.read_namespaced_deployment(name=deployment, namespace=namespace)
         current = int(getattr(dep.spec, "replicas", 0) or 0)
         target = min(current + 1, self.max_replicas)
         if target == current:
-            return current
+            return current, current
         self._apps.patch_namespaced_deployment_scale(
             name=deployment,
             namespace=namespace,
             body={"spec": {"replicas": target}},
         )
-        return target
+        return current, target
 
     def _cordon_node(self, node_name: str) -> None:
         self._core.patch_node(
             name=node_name, body={"spec": {"unschedulable": True}}
         )
+
+    def _evict_pod(self, pod: Any) -> bool:
+        """Attempt eviction. Returns False only if PDB-blocked (HTTP 429), True otherwise."""
+        try:
+            self._core.create_namespaced_pod_eviction(
+                name=pod.metadata.name,
+                namespace=pod.metadata.namespace,
+                body=k8s_client.V1Eviction(
+                    metadata=k8s_client.V1ObjectMeta(
+                        name=pod.metadata.name,
+                        namespace=pod.metadata.namespace,
+                    )
+                ),
+            )
+            return True
+        except ApiException as exc:
+            if exc.status == 429:
+                return False  # PDB-blocked — caller should retry
+            logger.warning(
+                "Eviction of %s/%s failed: %s",
+                pod.metadata.namespace,
+                pod.metadata.name,
+                exc,
+            )
+            return True  # non-retryable failure — don't hold up the drain
+        except Exception as exc:
+            logger.warning(
+                "Eviction of %s/%s failed: %s",
+                pod.metadata.namespace,
+                pod.metadata.name,
+                exc,
+            )
+            return True
 
     def _drain_node(self, node_name: str) -> str:
         self._cordon_node(node_name)
@@ -151,6 +190,8 @@ class Remediator:
         )
         evicted: list[str] = []
         skipped: list[str] = []
+        pdb_blocked: list[Any] = []
+
         for pod in pods.items:
             owners = pod.metadata.owner_references or []
             if any(o.kind in ("DaemonSet", "Node") for o in owners):
@@ -159,23 +200,31 @@ class Remediator:
             if pod.metadata.namespace in self.protected:
                 skipped.append(pod.metadata.name)
                 continue
-            try:
-                self._core.create_namespaced_pod_eviction(
-                    name=pod.metadata.name,
-                    namespace=pod.metadata.namespace,
-                    body=k8s_client.V1Eviction(
-                        metadata=k8s_client.V1ObjectMeta(
-                            name=pod.metadata.name,
-                            namespace=pod.metadata.namespace,
-                        )
-                    ),
-                )
+            if self._evict_pod(pod):
                 evicted.append(pod.metadata.name)
-            except ApiException as exc:
-                if exc.status == 429:
-                    skipped.append(f"{pod.metadata.name}(PDB-blocked)")
+            else:
+                pdb_blocked.append(pod)
+
+        # Retry PDB-blocked pods with increasing backoff (5s → 15s → 30s).
+        for delay in (5, 15, 30):
+            if not pdb_blocked:
+                break
+            logger.info(
+                "Drain: %d pod(s) PDB-blocked on %s — retrying in %ds",
+                len(pdb_blocked),
+                node_name,
+                delay,
+            )
+            time.sleep(delay)
+            still_blocked: list[Any] = []
+            for pod in pdb_blocked:
+                if self._evict_pod(pod):
+                    evicted.append(pod.metadata.name)
                 else:
-                    logger.warning("Eviction of %s failed: %s", pod.metadata.name, exc)
+                    still_blocked.append(pod)
+            pdb_blocked = still_blocked
+
+        skipped.extend(f"{p.metadata.name}(PDB-blocked)" for p in pdb_blocked)
         return (
             f"Drained node {node_name}: cordoned + evicted {len(evicted)} pod(s), "
             f"skipped {len(skipped)} (DaemonSet/protected/PDB-blocked)"
@@ -246,8 +295,14 @@ class Remediator:
                 self._restart_pod(namespace, target)
                 reason = f"Patched deployment/{target} restartedAt annotation"
             elif action == "scale_up":
-                new_replicas = self._scale_up(namespace, target)
+                original, new_replicas = self._scale_up(namespace, target)
                 reason = f"Scaled deployment/{target} to {new_replicas} replicas"
+                alert_key = str(plan.get("alert_key", ""))
+                if alert_key and new_replicas != original:
+                    with self._scale_lock:
+                        # Only record the first scale-up so we can restore to true original.
+                        if alert_key not in self._scale_state:
+                            self._scale_state[alert_key] = (namespace, target, original)
             elif action == "cordon_node":
                 self._cordon_node(target)
                 reason = f"Cordoned node {target}"
@@ -269,3 +324,38 @@ class Remediator:
 
         logger.info("Successfully executed %s on %s/%s", action, namespace, target)
         return _result(plan, executed=True, reason=reason, dry_run=False)
+
+    def scale_down_if_tracked(self, alert_key: str) -> None:
+        """Called when an alert resolves; reverses a tracked scale_up if one exists."""
+        with self._scale_lock:
+            state = self._scale_state.pop(alert_key, None)
+        if state is None:
+            return
+        namespace, deployment, original_replicas = state
+        if _is_dry_run():
+            logger.info(
+                "DRY_RUN: would scale down %s/%s to %d replica(s) (alert resolved: %s)",
+                namespace,
+                deployment,
+                original_replicas,
+                alert_key,
+            )
+            return
+        if not self._configured:
+            logger.warning("Cannot scale down %s/%s — K8s client not configured", namespace, deployment)
+            return
+        try:
+            self._apps.patch_namespaced_deployment_scale(
+                name=deployment,
+                namespace=namespace,
+                body={"spec": {"replicas": original_replicas}},
+            )
+            logger.info(
+                "Scaled down %s/%s to %d replica(s) after alert resolved: %s",
+                namespace,
+                deployment,
+                original_replicas,
+                alert_key,
+            )
+        except Exception as exc:
+            logger.error("Scale-down for %s/%s failed: %s", namespace, deployment, exc)

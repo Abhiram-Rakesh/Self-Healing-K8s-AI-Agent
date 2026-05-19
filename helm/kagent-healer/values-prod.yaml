@@ -3,6 +3,10 @@
 
 replicaCount: 2
 
+persistence:
+  enabled: true
+  size: 2Gi
+
 image:
   pullPolicy: IfNotPresent
 
