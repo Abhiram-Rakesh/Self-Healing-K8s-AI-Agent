@@ -10,6 +10,7 @@ import sys
 
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
+from agent import k8s_mcp_server
 from agent.agents import (
     ApprovalStore,
     AuditAgent,
@@ -148,10 +149,14 @@ def main() -> int:
     remediator = Remediator()
     approval_store = ApprovalStore()
 
+    # Wire the K8s MCP server so Gemini can call investigation tools in-process
+    k8s_mcp_server.init(context_builder, memory)
+    logger.info("K8s MCP server initialised with %d tools", len(k8s_mcp_server.ALL_DECLARATIONS))
+
     metrics = _build_metrics(cost_guard)
 
     triage = TriageAgent()
-    diagnosis = DiagnosisAgent(gemini, context_builder, memory, cost_guard)
+    diagnosis = DiagnosisAgent(gemini, cost_guard)
     remediation = RemediationAgent(remediator, approval_store=approval_store)
     audit = AuditAgent(memory=memory)
 

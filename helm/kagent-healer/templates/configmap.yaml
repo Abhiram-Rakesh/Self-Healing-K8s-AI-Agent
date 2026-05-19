@@ -22,6 +22,7 @@ data:
   GEMINI_API_KEY_SECRET: {{ .Values.agent.geminiApiKeySecret | quote }}
   SLACK_WEBHOOK_SECRET: {{ .Values.agent.slackWebhookSecret | quote }}
   GEMINI_MODEL: {{ .Values.agent.geminiModel | quote }}
+  GEMINI_MAX_TURNS: {{ .Values.agent.geminiMaxTurns | default "8" | quote }}
   WEBHOOK_PORT: {{ .Values.service.webhookPort | quote }}
   METRICS_PORT: {{ .Values.service.metricsPort | quote }}
   WEBHOOK_TOKEN: {{ .Values.agent.webhookToken | default "" | quote }}

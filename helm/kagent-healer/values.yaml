@@ -29,6 +29,8 @@ agent:
   geminiApiKeySecret: "kagent/gemini-api-key"
   slackWebhookSecret: "kagent/slack-webhook"
   geminiModel: "gemini-2.5-flash"
+  # Maximum MCP tool-calling turns per investigation before falling back to notify_only.
+  geminiMaxTurns: "8"
   # Set to secure the /webhook endpoint with Bearer-token auth.
   # Production: inject via extraEnv referencing a K8s Secret instead.
   webhookToken: ""
