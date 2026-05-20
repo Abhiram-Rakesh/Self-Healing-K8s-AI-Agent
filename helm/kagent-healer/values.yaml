@@ -40,8 +40,8 @@ agent:
   # Example: "http://kagent-healer.default.svc.cluster.local:8000"
   webhookBaseUrl: ""
 
-  # kagent controller connection — bridge forwards alerts here via A2A protocol
-  kagentControllerUrl: "http://kagent-controller.kagent.svc.cluster.local:8083"
+  # kagent agent connection — bridge forwards alerts directly to agent via A2A v0.3.0
+  kagentAgentUrl: "http://healer-agent.kagent.svc.cluster.local:8080"
   kagentNamespace: "kagent"
   kagentAgentName: "healer-agent"
 

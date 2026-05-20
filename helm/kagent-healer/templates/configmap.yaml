@@ -32,8 +32,8 @@ data:
   WEBHOOK_TOKEN: {{ .Values.agent.webhookToken | default "" | quote }}
   WEBHOOK_BASE_URL: {{ .Values.agent.webhookBaseUrl | default "" | quote }}
 
-  # kagent controller (A2A forwarding target)
-  KAGENT_CONTROLLER_URL: {{ .Values.agent.kagentControllerUrl | quote }}
+  # kagent agent (A2A v0.3.0 forwarding target — direct agent service, not controller)
+  KAGENT_AGENT_URL: {{ .Values.agent.kagentAgentUrl | quote }}
   KAGENT_NAMESPACE: {{ .Values.agent.kagentNamespace | quote }}
   KAGENT_AGENT_NAME: {{ .Values.agent.kagentAgentName | quote }}
 

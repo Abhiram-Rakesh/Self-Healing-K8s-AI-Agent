@@ -2,13 +2,9 @@
 
 Receives Alertmanager webhook POSTs, deduplicates within DEDUP_TTL_SECONDS,
 handles resolved alerts via scale_down_if_resolved, and forwards firing alerts
-to the kagent agent via the A2A protocol.
+to the kagent agent via the A2A protocol (JSON-RPC 2.0, message/send, v0.3.0).
 
 Also exposes /approve/<id> for HITL approval of cordon/drain actions.
-
-Note: kagent's A2A endpoint follows the Google A2A spec (JSON-RPC 2.0,
-method "tasks/send"). Verify the exact format against your kagent version
-by inspecting: kubectl port-forward -n kagent svc/kagent-controller 8083:8083
 """
 
 from __future__ import annotations
@@ -36,13 +32,13 @@ logger = logging.getLogger(__name__)
 DEDUP_TTL_SECONDS: int = int(os.environ.get("DEDUP_TTL_SECONDS", "300"))
 _WEBHOOK_TOKEN: str = os.environ.get("WEBHOOK_TOKEN", "")
 
-# kagent controller A2A endpoint: http://<controller>:8083/api/a2a/<ns>/<agent>
-_KAGENT_CONTROLLER_URL: str = os.environ.get(
-    "KAGENT_CONTROLLER_URL",
-    "http://kagent-controller.kagent.svc.cluster.local:8083",
-)
 _KAGENT_NAMESPACE: str = os.environ.get("KAGENT_NAMESPACE", "kagent")
 _KAGENT_AGENT_NAME: str = os.environ.get("KAGENT_AGENT_NAME", "healer-agent")
+# A2A v0.3.0: POST directly to the agent service, not the controller
+_KAGENT_AGENT_URL: str = os.environ.get(
+    "KAGENT_AGENT_URL",
+    f"http://{_KAGENT_AGENT_NAME}.{_KAGENT_NAMESPACE}.svc.cluster.local:8080",
+)
 
 # ---------------------------------------------------------------------------
 # Budget guard — caps forwarded alerts per UTC day (proxy for kagent/LLM calls)
@@ -105,26 +101,22 @@ def _build_prompt(alert: dict) -> str:
 
 
 def _forward_to_kagent(alert: dict) -> None:
-    """Forward a firing alert to the kagent agent via the A2A protocol."""
-    url = (
-        f"{_KAGENT_CONTROLLER_URL}/api/a2a" f"/{_KAGENT_NAMESPACE}/{_KAGENT_AGENT_NAME}"
-    )
-    task_id = uuid.uuid4().hex
-    # Google A2A spec: JSON-RPC 2.0, method "tasks/send"
+    """Forward a firing alert to the kagent agent via A2A v0.3.0 (message/send)."""
+    msg_id = uuid.uuid4().hex
     payload = {
         "jsonrpc": "2.0",
-        "id": task_id,
-        "method": "tasks/send",
+        "id": msg_id,
+        "method": "message/send",
         "params": {
-            "id": task_id,
             "message": {
+                "messageId": msg_id,
                 "role": "user",
                 "parts": [{"type": "text", "text": _build_prompt(alert)}],
             },
         },
     }
     try:
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = requests.post(_KAGENT_AGENT_URL, json=payload, timeout=10)
         logger.info(
             "Forwarded %s to kagent → HTTP %d", _alert_key(alert), resp.status_code
         )
