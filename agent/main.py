@@ -1,10 +1,16 @@
-"""KAgent startup: secrets, metrics, wiring, serve."""
+"""KAgent startup: init MCP server, run bridge in thread, serve FastMCP SSE server.
+
+Process layout:
+  Thread 1 (main): FastMCP SSE server on MCP_PORT (default 8080) — kagent calls write tools here
+  Thread 2 (daemon): BridgeServer on WEBHOOK_PORT (default 8000) — Alertmanager posts here
+"""
 
 from __future__ import annotations
 
 import logging
 import os
 import sys
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +40,6 @@ def _load_secrets_from_aws() -> None:
         logger.error("Failed to create Secrets Manager client: %s", exc)
         return
 
-    _fetch_secret(
-        sm,
-        os.environ.get("GEMINI_API_KEY_SECRET", "kagent/gemini-api-key"),
-        "GEMINI_API_KEY",
-    )
     _fetch_secret(
         sm,
         os.environ.get("SLACK_WEBHOOK_SECRET", "kagent/slack-webhook"),
@@ -72,7 +73,7 @@ def _init_mcp_server() -> None:
         apps_api = k8s_client.AppsV1Api()
     except Exception as exc:
         logger.warning(
-            "Kubernetes config not available (%s) — tools return Unavailable", exc
+            "Kubernetes config not available (%s) — write tools degraded", exc
         )
         core_api = None
         apps_api = None
@@ -87,77 +88,33 @@ def _init_mcp_server() -> None:
     )
 
 
-def _build_metrics(cost_guard: object) -> dict:
-    try:
-        from prometheus_client import (  # type: ignore[import-untyped]
-            Counter,
-            Gauge,
-            Histogram,
-        )
-
-        alerts_total = Counter(
-            "kagent_alerts_total", "Total alerts received", ["severity"]
-        )
-        gemini_calls_total = Counter(
-            "kagent_gemini_calls_total", "Total Gemini API calls"
-        )
-        actions_total = Counter(
-            "kagent_actions_total", "Total healing actions", ["action", "executed"]
-        )
-        healing_seconds = Histogram(
-            "kagent_healing_seconds", "Time spent per healing pipeline run"
-        )
-        last_confidence = Gauge(
-            "kagent_last_confidence", "Last Gemini confidence score"
-        )
-        requests_remaining = Gauge(
-            "kagent_requests_remaining", "Remaining Gemini requests today"
-        )
-        requests_remaining.set_function(lambda: float(cost_guard.remaining()))  # type: ignore[attr-defined]
-
-        return {
-            "alerts_total": alerts_total,
-            "gemini_calls_total": gemini_calls_total,
-            "actions_total": actions_total,
-            "healing_seconds": healing_seconds,
-            "last_confidence": last_confidence,
-            "requests_remaining": requests_remaining,
-        }
-    except Exception as exc:
-        logger.warning("Prometheus metrics unavailable: %s", exc)
-        return {}
-
-
 def main() -> int:
     _configure_logging()
     _load_secrets_from_aws()
     _init_mcp_server()
 
-    from agent.cost_guard import CostGuard
-    from agent.gemini import GeminiClient
-    from agent.server import WebhookServer
+    from agent.bridge import BridgeServer
+    from agent.mcp_server import _HAS_MCP, mcp
 
-    cost_guard = CostGuard()
-    _build_metrics(cost_guard)
+    # Start the Alertmanager bridge in a background thread
+    bridge = BridgeServer(port=int(os.environ.get("WEBHOOK_PORT", "8000")))
+    bridge_thread = threading.Thread(target=bridge.start, daemon=True, name="bridge")
+    bridge_thread.start()
+    logger.info("Bridge thread started on :%s", os.environ.get("WEBHOOK_PORT", "8000"))
 
+    if not _HAS_MCP or mcp is None:
+        logger.error("FastMCP not available — cannot serve write tools to kagent")
+        bridge_thread.join()
+        return 1
+
+    # FastMCP SSE server runs in the main thread (blocking, uses asyncio internally)
+    mcp_port = int(os.environ.get("MCP_PORT", "8080"))
+    logger.info("Starting FastMCP SSE server on port %d", mcp_port)
+    os.environ.setdefault("MCP_PORT", str(mcp_port))
     try:
-        from prometheus_client import start_http_server  # type: ignore[import-untyped]
-
-        start_http_server(int(os.environ.get("METRICS_PORT", "8001")))
-        logger.info("Prometheus metrics on :%s", os.environ.get("METRICS_PORT", "8001"))
-    except Exception as exc:
-        logger.warning("Could not start metrics server: %s", exc)
-
-    gemini = GeminiClient()
-    server = WebhookServer(
-        gemini,
-        cost_guard,
-        port=int(os.environ.get("WEBHOOK_PORT", "8000")),
-    )
-    try:
-        server.start()
+        mcp.run(transport="sse", host="0.0.0.0", port=mcp_port)
     except KeyboardInterrupt:
-        server.stop()
+        bridge.stop()
     return 0
 
 

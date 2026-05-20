@@ -1,0 +1,19 @@
+# kagent ModelConfig — tells kagent which LLM to use for the healer agent.
+#
+# Prerequisites:
+#   kubectl create secret generic kagent-gemini \
+#     -n kagent \
+#     --from-literal GOOGLE_API_KEY=<your-gemini-api-key>
+#
+# Apply: kubectl apply -f k8s/kagent/model-config.yaml
+apiVersion: kagent.dev/v1alpha2
+kind: ModelConfig
+metadata:
+  name: gemini-model-config
+  namespace: kagent
+spec:
+  provider: Gemini
+  model: gemini-2.5-flash
+  apiKeySecret: kagent-gemini
+  apiKeySecretKey: GOOGLE_API_KEY
+  gemini: {}

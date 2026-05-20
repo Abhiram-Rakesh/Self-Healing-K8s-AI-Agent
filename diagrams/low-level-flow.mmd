@@ -1,86 +1,77 @@
 sequenceDiagram
     autonumber
     participant AM as Alertmanager
-    participant OP as Operator
-    participant WH as WebhookServer (:8000)
-    participant PL as pipeline.run()
-    participant CG as CostGuard
-    participant GC as GeminiClient
-    participant MCP as MCPServer (mcp_server.py)
+    participant BR as Bridge (:8000)
+    participant KC as kagent Controller
+    participant AG as healer-agent (kagent)
+    participant KTS as kagent-tool-server
+    participant HMS as healer-mcp-server (:8080)
     participant K as Kubernetes API
     participant DB as SQLite (incidents)
     participant SL as Slack / CloudWatch
 
-    AM->>WH: POST /webhook {alerts:[...]}
-    WH-->>AM: 200 (async — thread spawned)
+    AM->>BR: POST /webhook {alerts:[...]}
+    BR-->>AM: 200 (async — thread spawned)
 
     alt status == "resolved"
-        WH->>PL: run(alert)
-        PL->>MCP: scale_down_if_resolved(alert_key)
-        MCP->>K: patch deployment (restore original replicas)
+        BR->>HMS: scale_down_if_resolved(alert_key) [in-process]
+        HMS->>K: patch deployment (restore original replicas)
     else status == "firing"
-        WH->>PL: run(alert) [daemon thread]
-        PL->>PL: triage(alert) — dedup check
-        alt duplicate within TTL (300s)
-            PL-->>WH: drop — return
+        BR->>BR: dedup check (300s TTL)
+        alt duplicate within TTL
+            BR-->>BR: drop — return
         else new alert
-            PL->>CG: check_and_increment()
-            alt budget exhausted
-                CG-->>PL: False — skip
-            else budget ok
-                CG-->>PL: True
-                PL->>GC: diagnose(triage_result)
-                Note over GC: Build GenerateContentConfig<br/>with ALL_DECLARATIONS tools
-                GC->>GC: Gemini API call #1
+            BR->>KC: POST /api/a2a/kagent/healer-agent\n{jsonrpc, method: tasks/send, params: {message}}
+            KC->>AG: start agent run with alert prompt
 
-                loop MCP tool-calling (up to GEMINI_MAX_TURNS=8)
-                    GC->>MCP: get_pod_events(namespace, pod)
-                    MCP->>K: list_namespaced_event
-                    K-->>MCP: events list
-                    MCP-->>GC: JSON sorted newest-first
+            AG->>HMS: recall_past_cases(alert_type)
+            HMS->>DB: SELECT incidents WHERE alert_type=?
+            DB-->>HMS: last 3 records
+            HMS-->>AG: past case summary
 
-                    GC->>MCP: get_pod_logs(namespace, pod)
-                    MCP->>K: read_namespaced_pod_log (previous=True first)
-                    K-->>MCP: log lines
-                    MCP-->>GC: [previous] or [current] logs
+            AG->>KTS: k8s_get_pod_logs(namespace, pod)
+            KTS->>K: read pod logs
+            K-->>KTS: log lines
+            KTS-->>AG: logs
 
-                    opt if more evidence needed
-                        GC->>MCP: describe_pod / get_node_conditions / recall_past_cases / resolve_deployment
-                        MCP->>K: K8s API call or SQLite read
-                        K-->>MCP: data
-                        MCP-->>GC: structured result
-                    end
+            AG->>KTS: k8s_get_events(namespace, pod)
+            KTS->>K: list events
+            K-->>KTS: events list
+            KTS-->>AG: events JSON
 
-                    alt confidence >= 0.75
-                        Note over MCP: Safety gates inside write tool:<br/>1. confidence gate<br/>2. protected-namespace gate<br/>3. dry-run gate
-                        GC->>MCP: restart_deployment / scale_deployment (write tool)
-                        MCP->>K: patch_namespaced_deployment / scale
-                        K-->>MCP: ok / api error
-                        MCP-->>GC: "Restarted deployment/X" or "DRY_RUN: …"
-                    else cordon_node / drain_node (HITL path)
-                        GC->>MCP: cordon_node / drain_node
-                        MCP->>MCP: ApprovalStore.register(action_id)
-                        MCP->>SL: Slack HITL request + /approve/<id> URL
-                        alt operator approves before timeout
-                            OP->>WH: POST /approve/<action_id>
-                            WH->>MCP: approval_store.approve(action_id)
-                            MCP-->>WH: event.set() → True
-                        else APPROVAL_TIMEOUT_SECONDS elapsed
-                            Note over MCP: auto-approve (event.wait timeout)
-                        end
-                        MCP->>K: patch_node unschedulable + evict pods (PDB retry 5s→15s→30s)
-                        K-->>MCP: ok / api error
-                        MCP-->>GC: drain/cordon result
-                    end
-
-                    GC->>MCP: record_outcome(...) — FINAL tool call
-                    Note over GC,MCP: record_outcome captured — loop breaks
-                    MCP->>DB: INSERT INTO incidents
-                    MCP->>SL: POST Slack + CloudWatch put_metric_data
-                    MCP-->>GC: {"status": "recorded"}
-                end
-
-                GC-->>PL: result dict {action, confidence, executed, ...}
+            opt if more evidence needed
+                AG->>KTS: k8s_describe_resource / k8s_get_resources
+                KTS->>K: K8s API call
+                K-->>KTS: data
+                KTS-->>AG: structured result
             end
+
+            alt confidence >= 0.75 — standard write
+                Note over HMS: Safety gates inside write tool:<br/>1. confidence gate<br/>2. protected-namespace gate<br/>3. dry-run gate
+                AG->>HMS: restart_deployment / scale_deployment
+                HMS->>K: patch deployment
+                K-->>HMS: ok / api error
+                HMS-->>AG: "Restarted deployment/X" or "DRY_RUN: …"
+            else confidence >= 0.75 — HITL path (cordon/drain)
+                AG->>HMS: cordon_node / drain_node
+                HMS->>SL: Slack HITL request + /approve/<id> URL
+                alt operator approves before timeout
+                    note over BR: POST /approve/<action_id>
+                    BR->>HMS: approval_store.approve(action_id) [in-process]
+                    HMS-->>BR: event.set() → True
+                else APPROVAL_TIMEOUT_SECONDS elapsed
+                    Note over HMS: auto-approve (event.wait timeout)
+                end
+                HMS->>K: patch_node unschedulable + evict pods (PDB retry 5s→15s→30s)
+                K-->>HMS: ok / api error
+                HMS-->>AG: drain/cordon result
+            else confidence < 0.75
+                Note over AG: action = notify_only
+            end
+
+            AG->>HMS: record_outcome(...) — FINAL tool call
+            HMS->>DB: INSERT INTO incidents
+            HMS->>SL: POST Slack audit + CloudWatch put_metric_data
+            HMS-->>AG: "Outcome recorded for ..."
         end
     end

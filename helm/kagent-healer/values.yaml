@@ -18,25 +18,32 @@ serviceAccount:
   annotations: {}
 
 agent:
+  # Safety controls
   dryRun: "true"
   confidenceThreshold: "0.75"
   maxReplicas: "10"
   dailyRequestLimit: "200"
+
+  # Storage paths (overridden by persistence.enabled)
   memoryDbPath: "/tmp/kagent-memory.db"
   auditLogPath: "/tmp/kagent-audit.jsonl"
+
   logLevel: "INFO"
+
+  # AWS Secrets Manager — loads SLACK_WEBHOOK_URL at startup
   secretsManagerRegion: "ap-south-1"
-  geminiApiKeySecret: "kagent/gemini-api-key"
   slackWebhookSecret: "kagent/slack-webhook"
-  geminiModel: "gemini-2.5-flash"
-  # Maximum MCP tool-calling turns per investigation before falling back to notify_only.
-  geminiMaxTurns: "8"
-  # Set to secure the /webhook endpoint with Bearer-token auth.
-  # Production: inject via extraEnv referencing a K8s Secret instead.
+
+  # Webhook auth — inject via extraEnv referencing a K8s Secret in production
   webhookToken: ""
-  # External base URL of this service, used to build the /approve/<id> URL in Slack messages.
-  # Example: "http://kagent-healer.kagent.svc.cluster.local:8000"
+  # External base URL of this service, used to build /approve/<id> URLs in Slack messages.
+  # Example: "http://kagent-healer.default.svc.cluster.local:8000"
   webhookBaseUrl: ""
+
+  # kagent controller connection — bridge forwards alerts here via A2A protocol
+  kagentControllerUrl: "http://kagent-controller.kagent.svc.cluster.local:8083"
+  kagentNamespace: "kagent"
+  kagentAgentName: "healer-agent"
 
 persistence:
   enabled: false
@@ -44,9 +51,7 @@ persistence:
   storageClass: ""
   accessMode: ReadWriteOnce
 
-podAnnotations:
-  prometheus.io/scrape: "true"
-  prometheus.io/port: "8001"
+podAnnotations: {}
 
 podSecurityContext:
   runAsNonRoot: true
@@ -72,15 +77,8 @@ resources:
 
 service:
   type: ClusterIP
-  webhookPort: 8000
-  metricsPort: 8001
-
-serviceMonitor:
-  enabled: true
-  interval: 15s
-  labels: {}
-  metricRelabelings: []
-  relabelings: []
+  webhookPort: 8000   # Alertmanager bridge — Alertmanager posts here
+  mcpPort: 8080       # FastMCP SSE server — kagent calls write tools here
 
 hpa:
   enabled: false
@@ -88,7 +86,6 @@ hpa:
   maxReplicas: 3
   targetCPUUtilizationPercentage: 70
 
-# RBAC the agent needs in-cluster (pod logs, events, deployments, nodes).
 rbac:
   create: true
 

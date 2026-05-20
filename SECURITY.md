@@ -39,6 +39,7 @@ crediting the reporter (unless anonymity is requested).
 | HITL for high-impact actions | `cordon_node` / `drain_node` send a Slack notification and wait for approval |
 | Non-root container | Agent runs as UID 1000, all capabilities dropped, read-only root filesystem |
 | IRSA (no static keys) | AWS access uses IAM Roles for Service Accounts — no long-lived credentials |
-| Secrets Manager | Gemini API key and Slack webhook are stored in AWS Secrets Manager, not in ConfigMaps |
+| Secrets Manager | Slack webhook is stored in AWS Secrets Manager; Gemini API key is in a K8s Secret (`kagent-gemini`) managed by kagent — neither is in ConfigMaps |
+| kagent safety boundary | kagent only calls tools that are explicitly listed in the Agent CRD `toolNames` — no tool is callable unless declared |
 | Trivy scan in CI | Every image push is scanned for CRITICAL CVEs before promotion |
 | Least-privilege RBAC | ClusterRole grants only the specific verbs needed (get/list/watch/patch on targeted resources) |

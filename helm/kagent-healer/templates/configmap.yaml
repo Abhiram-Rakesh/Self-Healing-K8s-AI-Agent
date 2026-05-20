@@ -6,10 +6,13 @@ metadata:
   labels:
     {{- include "kagent-healer.labels" . | nindent 4 }}
 data:
+  # Safety controls
   DRY_RUN: {{ .Values.agent.dryRun | quote }}
   CONFIDENCE_THRESHOLD: {{ .Values.agent.confidenceThreshold | quote }}
   MAX_REPLICAS: {{ .Values.agent.maxReplicas | quote }}
   DAILY_REQUEST_LIMIT: {{ .Values.agent.dailyRequestLimit | quote }}
+
+  # Storage
   {{- if .Values.persistence.enabled }}
   MEMORY_DB_PATH: "/data/kagent-memory.db"
   AUDIT_LOG_PATH: "/data/kagent-audit.jsonl"
@@ -17,14 +20,24 @@ data:
   MEMORY_DB_PATH: {{ .Values.agent.memoryDbPath | quote }}
   AUDIT_LOG_PATH: {{ .Values.agent.auditLogPath | quote }}
   {{- end }}
+
   LOG_LEVEL: {{ .Values.agent.logLevel | quote }}
+
+  # AWS Secrets Manager
   SECRETS_MANAGER_REGION: {{ .Values.agent.secretsManagerRegion | quote }}
-  GEMINI_API_KEY_SECRET: {{ .Values.agent.geminiApiKeySecret | quote }}
   SLACK_WEBHOOK_SECRET: {{ .Values.agent.slackWebhookSecret | quote }}
-  GEMINI_MODEL: {{ .Values.agent.geminiModel | quote }}
-  GEMINI_MAX_TURNS: {{ .Values.agent.geminiMaxTurns | default "8" | quote }}
+
+  # Bridge
   WEBHOOK_PORT: {{ .Values.service.webhookPort | quote }}
-  METRICS_PORT: {{ .Values.service.metricsPort | quote }}
   WEBHOOK_TOKEN: {{ .Values.agent.webhookToken | default "" | quote }}
   WEBHOOK_BASE_URL: {{ .Values.agent.webhookBaseUrl | default "" | quote }}
+
+  # kagent controller (A2A forwarding target)
+  KAGENT_CONTROLLER_URL: {{ .Values.agent.kagentControllerUrl | quote }}
+  KAGENT_NAMESPACE: {{ .Values.agent.kagentNamespace | quote }}
+  KAGENT_AGENT_NAME: {{ .Values.agent.kagentAgentName | quote }}
+
+  # FastMCP SSE server port (kagent calls write tools here)
+  MCP_PORT: {{ .Values.service.mcpPort | quote }}
+
   PYTHONDONTWRITEBYTECODE: "1"

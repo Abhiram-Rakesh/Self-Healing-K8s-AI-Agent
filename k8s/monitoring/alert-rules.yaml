@@ -85,22 +85,12 @@ spec:
             summary: "KAgent healer is down"
             description: "The kagent-healer webhook/metrics server has not been reachable for 2 minutes. No self-healing will occur until it recovers."
 
-        - alert: KAgentBudgetNearExhaustion
-          expr: kagent_requests_remaining_today < 20
-          for: 5m
+        - alert: KAgentHealerMCPUnreachable
+          expr: kube_pod_container_status_ready{namespace="default",container="kagent-healer"} == 0
+          for: 2m
           labels:
             severity: warning
             kagent: "false"
           annotations:
-            summary: "KAgent Gemini daily budget nearly exhausted ({{ $value }} requests left)"
-            description: "Fewer than 20 Gemini requests remain for today. The agent will fall back to notify-only mode once the budget hits zero."
-
-        - alert: KAgentHighStageErrorRate
-          expr: sum(rate(kagent_stage_errors_total[5m])) * 60 > 0.5
-          for: 5m
-          labels:
-            severity: warning
-            kagent: "false"
-          annotations:
-            summary: "KAgent pipeline stage error rate is high"
-            description: "More than 0.5 pipeline stage errors per minute over the last 5 minutes. Check agent logs for root cause."
+            summary: "KAgent healer MCP server container is not ready"
+            description: "The kagent-healer container has been not-ready for 2 minutes. kagent may not be able to call write tools (restart, scale, cordon, drain)."

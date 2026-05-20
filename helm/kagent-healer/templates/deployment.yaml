@@ -35,8 +35,8 @@ spec:
             - name: webhook
               containerPort: {{ .Values.service.webhookPort }}
               protocol: TCP
-            - name: metrics
-              containerPort: {{ .Values.service.metricsPort }}
+            - name: mcp
+              containerPort: {{ .Values.service.mcpPort }}
               protocol: TCP
           envFrom:
             - configMapRef:

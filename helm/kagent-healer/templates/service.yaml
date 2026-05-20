@@ -12,9 +12,9 @@ spec:
       targetPort: webhook
       protocol: TCP
       name: webhook
-    - port: {{ .Values.service.metricsPort }}
-      targetPort: metrics
+    - port: {{ .Values.service.mcpPort }}
+      targetPort: mcp
       protocol: TCP
-      name: metrics
+      name: mcp
   selector:
     {{- include "kagent-healer.selectorLabels" . | nindent 4 }}

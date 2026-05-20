@@ -2,20 +2,26 @@ flowchart LR
     subgraph K8s["AWS EKS Cluster"]
         P[Workload Pods] -->|metrics| PR[Prometheus]
         PR -->|alerts fire| AM[Alertmanager]
-        AM -->|webhook| AG[kagent-healer\nMCP Server + Gemini tool-calling loop]
-        AG -->|MCP read tools: logs / events / pod spec| K8sAPI[Kubernetes API]
-        AG -->|MCP write tools: restart / scale / cordon / drain| K8sAPI
-        AG -->|metrics :8001| PR
+        AM -->|webhook POST /webhook| BR[kagent-healer\nBridge :8000]
+        BR -->|A2A tasks/send| KC[kagent Controller\n:8083]
+        KC -->|Gemini tool-calling loop| AG[healer-agent\nAgent CRD]
+        AG -->|read tools: logs / events / describe| KTS[kagent-tool-server\nBuilt-in K8s MCP]
+        AG -->|write tools: restart / scale / cordon / drain| HMS[healer-mcp-server\nCustom MCP :8080]
+        KTS -->|kubectl reads| K8sAPI[Kubernetes API]
+        HMS -->|safety-gated writes| K8sAPI
+        BR -->|scale_down_if_resolved on resolve| K8sAPI
     end
 
-    AG -->|tool-calling investigation + action| G[(Gemini 2.5 Flash)]
-    AG -->|record_outcome: HITL approval + audit notify| S[Slack]
-    AG -->|record_outcome: healing metric| CW[CloudWatch Metrics & Logs]
-    AG -->|recall_past_cases / record_outcome| MEM[(SQLite memory)]
+    KC -->|Gemini 2.5 Flash| G[(Gemini API)]
+    HMS -->|record_outcome: audit + notify| S[Slack]
+    HMS -->|record_outcome: healing metric| CW[CloudWatch Metrics & Logs]
+    HMS -->|recall_past_cases / record_outcome| MEM[(SQLite memory)]
 
-    classDef agent fill:#4f46e5,color:#fff,stroke:#312e81;
+    classDef kagent fill:#7c3aed,color:#fff,stroke:#4c1d95;
+    classDef healer fill:#4f46e5,color:#fff,stroke:#312e81;
     classDef ai fill:#16a34a,color:#fff,stroke:#14532d;
     classDef store fill:#0891b2,color:#fff,stroke:#155e75;
-    class AG agent
+    class KC,AG,KTS kagent
+    class BR,HMS healer
     class G ai
     class MEM,CW store

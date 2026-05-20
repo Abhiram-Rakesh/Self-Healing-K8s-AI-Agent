@@ -7,10 +7,12 @@
 [![AWS EKS](https://img.shields.io/badge/AWS-EKS-FF9900.svg?logo=amazonaws&logoColor=white)](https://aws.amazon.com/eks/)
 [![Terraform](https://img.shields.io/badge/terraform-1.10%2B-7B42BC.svg?logo=terraform&logoColor=white)](https://www.terraform.io/)
 
-An AI-powered self-healing platform for Amazon EKS. Prometheus alerts are routed
-to a Python agent running KAgent, which calls Gemini 2.5 Flash to diagnose the
-root cause, then executes a safe Kubernetes remediation (restart, scale, cordon,
-or drain) behind a confidence threshold and a dry-run gate.
+An AI-powered self-healing platform for Amazon EKS built on the
+[kagent](https://kagent.dev) framework. Prometheus alerts are routed to a thin
+bridge that forwards them to a kagent-managed Gemini 2.5 Flash agent. The agent
+investigates using kagent's built-in Kubernetes MCP tools, then executes
+remediation (restart, scale, cordon, or drain) through a custom safety-gated MCP
+server behind a confidence threshold and a dry-run gate.
 
 ---
 
@@ -21,13 +23,17 @@ flowchart LR
     subgraph K8s["AWS EKS Cluster"]
         P[Workload Pods] -->|metrics| PR[Prometheus]
         PR -->|alerts fire| AM[Alertmanager]
-        AM -->|webhook| AG[kagent-healer\nMCP Server + Gemini tool-calling loop]
-        AG -->|MCP read tools: logs / events / pod spec| K8sAPI[Kubernetes API]
-        AG -->|MCP write tools: restart / scale / cordon / drain| K8sAPI
+        AM -->|webhook POST /webhook| BR[kagent-healer\nBridge :8000]
+        BR -->|A2A tasks/send| KC[kagent Controller\n:8083]
+        KC -->|Gemini tool-calling loop| AG[healer-agent\nAgent CRD]
+        AG -->|read tools: logs / events / describe| KTS[kagent-tool-server\nBuilt-in K8s MCP]
+        AG -->|write tools: restart / scale / cordon / drain| HMS[healer-mcp-server\nCustom MCP :8080]
+        KTS --> K8sAPI[Kubernetes API]
+        HMS -->|safety-gated writes| K8sAPI
     end
-    AG -->|tool-calling investigation + action| G[(Gemini 2.5 Flash)]
-    AG -->|record_outcome: audit + notify| CW[CloudWatch + Slack]
-    AG -->|recall_past_cases / record_outcome| MEM[(SQLite memory)]
+    KC -->|Gemini 2.5 Flash| G[(Gemini API)]
+    HMS -->|record_outcome: audit + notify| CW[CloudWatch + Slack]
+    HMS -->|recall / record_outcome| MEM[(SQLite memory)]
 ```
 
 ---
@@ -40,9 +46,10 @@ flowchart LR
 | IaC              | Terraform 1.10+, S3 native locking  | Reproducible cluster provisioning (no DynamoDB needed)     |
 | Observability    | kube-prometheus-stack, Loki, Grafana | Metrics, logs, alerting, dashboards                       |
 | Chaos            | Litmus ChaosCenter               | Repeatable failure injection                                  |
-| AI               | Google Gemini 2.5 Flash          | Drives investigation and action via MCP tool-calling loop     |
-| Agent framework  | KAgent (MCP server + Gemini loop)| All K8s I/O in `mcp_server.py`; Gemini calls tools directly  |
-| Runtime          | Python 3.11 (stdlib HTTP server) | Webhook server, K8s client, Gemini SDK                        |
+| AI               | Google Gemini 2.5 Flash          | LLM — driven by kagent's tool-calling loop                    |
+| Agent framework  | [kagent](https://kagent.dev) (CNCF sandbox) | Manages Agent CRD, Gemini loop, built-in K8s MCP tools |
+| Custom MCP server| Python 3.11 + FastMCP            | Safety-gated write tools, HITL approval, SQLite memory        |
+| Bridge           | Python 3.11 (stdlib HTTP server) | Thin Alertmanager→kagent forwarder with dedup                 |
 | Memory           | SQLite (stdlib)                  | Past incident store — no external DB needed                   |
 | Packaging        | Docker (multi-stage, non-root, amd64+arm64) | Reproducible agent image, runs on Graviton nodes     |
 | Deployment       | Helm v3                          | Templated K8s install of the agent                            |
@@ -482,21 +489,38 @@ kubectl get pods -n litmus
 
 **Success indicator:** Litmus frontend / backend / mongo pods all show `Running`.
 
-#### 5e — KAgent
+#### 5e — kagent framework
+
+kagent is the AI agent framework that manages the Gemini tool-calling loop, the
+Agent CRD, and the built-in Kubernetes MCP tools.
 
 ```bash
-helm repo add kagent https://kagent-dev.github.io/kagent
-helm repo update
-
-# CRDs first (KAgent requires them installed and established before the chart).
-helm install kagent-crds kagent/kagent-crds \
+# Install CRDs first
+helm install kagent-crds \
+  oci://ghcr.io/kagent-dev/kagent/helm/kagent-crds \
   --namespace kagent --create-namespace
 sleep 15
 
-helm install kagent kagent/kagent \
+# Install kagent with Gemini as the default provider
+helm install kagent \
+  oci://ghcr.io/kagent-dev/kagent/helm/kagent \
   --namespace kagent \
   --set providers.default=gemini \
+  --set providers.gemini.apiKey="$GEMINI_API_KEY" \
   --wait
+```
+
+Create the Gemini API key secret (referenced by the `ModelConfig` CRD):
+```bash
+kubectl create secret generic kagent-gemini \
+  -n kagent \
+  --from-literal GOOGLE_API_KEY="$GEMINI_API_KEY"
+```
+
+Apply the kagent resources (ModelConfig, RemoteMCPServer, Agent CRDs):
+```bash
+# These are applied AFTER the healer is deployed (Step 9) so the MCP service URL resolves.
+# See Step 9b below.
 ```
 
 Verify:
@@ -504,7 +528,7 @@ Verify:
 kubectl get pods -n kagent
 ```
 
-**Success indicator:** All KAgent pods (controller, UI, gateway) show `Running`.
+**Success indicator:** All kagent pods (controller, UI, engine) show `Running`.
 
 ### Step 6 — Push secrets to AWS Secrets Manager
 
@@ -596,12 +620,17 @@ aws ecr describe-images --repository-name kagent-healer --region "$AWS_REGION" \
 
 **Success indicator:** Image appears with tag `latest` and a recent push timestamp.
 
-### Step 9 — Deploy the healer agent
+### Step 9 — Deploy the healer
+
+#### 9a — Deploy the kagent-healer Helm chart
+
+The healer Helm chart deploys two components in one pod:
+- **Bridge** (`:8000`) — receives Alertmanager webhooks, deduplicates, forwards to kagent
+- **Custom MCP server** (`:8080`) — safety-gated write tools that kagent calls via SSE
 
 ```bash
 helm upgrade --install kagent-healer helm/kagent-healer/ \
-  --namespace kagent \
-  --create-namespace \
+  --namespace default \
   --set image.repository="${ECR_URL}" \
   --set image.tag=latest \
   --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="${KAGENT_IRSA_ARN}" \
@@ -612,21 +641,17 @@ helm upgrade --install kagent-healer helm/kagent-healer/ \
 For production clusters, overlay `values-prod.yaml` which enables live healing,
 higher confidence threshold (0.80), PodDisruptionBudget, NetworkPolicy, and
 **persistent storage** for the incident memory and audit log (survives pod restarts).
-HPA is intentionally disabled in this overlay — SQLite does not support concurrent
-writes from multiple pods sharing a `ReadWriteOnce` PVC, so `replicaCount` is
-kept at 1. To run multiple replicas, replace the SQLite memory backend with a
-shared database and set `persistence.enabled=false`.
 
 ```bash
 helm upgrade --install kagent-healer helm/kagent-healer/ \
-  --namespace kagent \
+  --namespace default \
   -f helm/kagent-healer/values-prod.yaml \
   --set image.repository="${ECR_URL}" \
   --set image.tag=latest \
   --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="${KAGENT_IRSA_ARN}" \
   --wait
 
-kubectl get pods -n kagent -l app.kubernetes.io/name=kagent-healer
+kubectl get pods -l app.kubernetes.io/name=kagent-healer
 ```
 
 Expected output:
@@ -637,17 +662,48 @@ kagent-healer-6d8f9b7c4-xk2pv     1/1     Running   0          45s
 
 Verify the health endpoint via port-forward:
 ```bash
-kubectl -n kagent port-forward svc/kagent-healer 8000:8000 &
+kubectl port-forward svc/kagent-healer 8000:8000 &
 curl http://localhost:8000/health
 kill %1 2>/dev/null
 ```
 
 Expected response:
 ```json
-{"status":"ok","version":"1.0.0"}
+{"status":"ok","version":"2.0.0"}
 ```
 
 **Success indicator:** Pod shows `1/1 Running` and `/health` returns `{"status":"ok"}`.
+
+#### 9b — Apply kagent CRDs (ModelConfig, RemoteMCPServer, Agent)
+
+Once the healer service is up, apply the kagent resource definitions. The
+`RemoteMCPServer` URL must resolve, so this step comes after 9a.
+
+```bash
+kubectl apply -f k8s/kagent/model-config.yaml
+kubectl apply -f k8s/kagent/remote-mcp-server.yaml
+kubectl apply -f k8s/kagent/agent.yaml
+```
+
+Verify:
+```bash
+kubectl get modelconfig,remotemcpserver,agent -n kagent
+```
+
+Expected output:
+```
+NAME                                         AGE
+modelconfig.kagent.dev/gemini-model-config   10s
+
+NAME                                              AGE
+remotemcpserver.kagent.dev/kagent-tool-server     5m
+remotemcpserver.kagent.dev/healer-mcp-server      10s
+
+NAME                               AGE
+agent.kagent.dev/healer-agent      10s
+```
+
+**Success indicator:** `healer-agent` appears and `healer-mcp-server` shows `AGE > 0`.
 
 ### Step 10 — Verify the end-to-end healing loop
 
@@ -663,18 +719,25 @@ agent logs:
 kubectl logs -n kagent -l app.kubernetes.io/name=kagent-healer -f
 ```
 
-Expected agent log lines (abridged):
+Expected log lines (bridge + kagent controller + healer MCP server):
 ```
-2026-05-18 12:34:56 INFO agent.server | Received 1 alert(s) from Alertmanager
-2026-05-18 12:34:56 INFO agent.pipeline | alert_key=PodCrashLooping:default:crash-test-... severity=critical weight=3
-2026-05-18 12:34:57 INFO agent.gemini | MCP tool get_pod_events          → 342 chars
-2026-05-18 12:34:57 INFO agent.gemini | MCP tool get_pod_logs            → 1024 chars
-2026-05-18 12:34:58 INFO agent.gemini | MCP tool restart_deployment      → 48 chars
-2026-05-18 12:34:58 INFO agent.mcp_server | DRY_RUN: would execute restart_deployment on default/crash-test
+# Bridge log (kagent-healer pod)
+2026-05-18 12:34:56 INFO agent.bridge | Forwarded PodCrashLooping:default:crash-test to kagent → HTTP 200
+
+# kagent controller log (kagent namespace)
+2026-05-18 12:34:56 INFO kagent | Starting agent run healer-agent for task <task-id>
+2026-05-18 12:34:57 INFO kagent | Tool call: recall_past_cases(alert_type=PodCrashLooping)
+2026-05-18 12:34:57 INFO kagent | Tool call: k8s_get_pod_logs(namespace=default, pod=crash-test-...)
+2026-05-18 12:34:58 INFO kagent | Tool call: k8s_get_events(namespace=default, resource=crash-test-...)
+2026-05-18 12:34:59 INFO kagent | Tool call: restart_deployment(namespace=default, deployment=crash-test, confidence=0.92)
+
+# Custom MCP server log (kagent-healer pod)
+2026-05-18 12:34:59 INFO agent.mcp_server | DRY_RUN: would execute restart_deployment on default/crash-test
 ```
 
-**Success indicator:** Agent log shows `MCP tool restart_deployment` followed
-by a `DRY_RUN` or `Restarted deployment/` line for the same alert.
+**Success indicator:** Bridge log shows `HTTP 200` forwarding to kagent, and
+the healer MCP server log shows `DRY_RUN: would execute restart_deployment` (or
+`Restarted deployment/` when `DRY_RUN=false`).
 
 To switch to **live** healing (no dry-run), re-run the Helm command from Step 9
 with `--set agent.dryRun="false"` — see [Enabling live healing](#enabling-live-healing-dry_runfalse).
@@ -729,44 +792,52 @@ the action Gemini suggests (enforced inside each MCP write tool in `agent/mcp_se
 
 ## Configuration reference
 
-| Env var                 | Helm value                          | Description                                                          | Default                       | Required          |
-|-------------------------|-------------------------------------|----------------------------------------------------------------------|-------------------------------|-------------------|
-| `GEMINI_API_KEY`        | (from Secrets Manager)              | Google Gemini API key                                                | —                             | yes               |
-| `GEMINI_MODEL`          | `agent.geminiModel`                 | Gemini model to call                                                 | `gemini-2.5-flash`            | no                |
-| `GEMINI_MAX_TURNS`      | `agent.geminiMaxTurns`              | Max MCP tool-calling turns per investigation before fallback         | `8`                           | no                |
-| `DRY_RUN`               | `agent.dryRun`                      | If `true`, log actions but do not touch the cluster                  | `true`                        | no                |
-| `CONFIDENCE_THRESHOLD`  | `agent.confidenceThreshold`         | Minimum Gemini confidence to act                                     | `0.75`                        | no                |
-| `MAX_REPLICAS`          | `agent.maxReplicas`                 | Hard cap for `scale_deployment`                                      | `10`                          | no                |
-| `DAILY_REQUEST_LIMIT`   | `agent.dailyRequestLimit`           | Max Gemini API calls per UTC day                                     | `200`                         | no                |
-| `MEMORY_DB_PATH`        | `agent.memoryDbPath`                | SQLite file for the incident memory                                  | `/tmp/kagent-memory.db`       | no                |
-| `AUDIT_LOG_PATH`        | `agent.auditLogPath`                | JSONL audit log path                                                 | `/tmp/kagent-audit.jsonl`     | no                |
-| `LOG_LEVEL`             | `agent.logLevel`                    | Python log level                                                     | `INFO`                        | no                |
-| `SECRETS_MANAGER_REGION`| `agent.secretsManagerRegion`        | Region used by boto3 at startup                                      | `ap-south-1`                   | no                |
-| `GEMINI_API_KEY_SECRET` | `agent.geminiApiKeySecret`          | Secrets Manager ID for the Gemini key                                | `kagent/gemini-api-key`       | no                |
-| `SLACK_WEBHOOK_SECRET`  | `agent.slackWebhookSecret`          | Secrets Manager ID for the Slack URL (optional)                      | `kagent/slack-webhook`        | no                |
-| `WEBHOOK_PORT`          | `service.webhookPort`               | HTTP port for the Alertmanager webhook                               | `8000`                        | no                |
-| `METRICS_PORT`          | `service.metricsPort`               | Prometheus metrics port                                              | `8001`                        | no                |
-| `WEBHOOK_TOKEN`         | `agent.webhookToken`                | If set, `POST /webhook` requires `Authorization: Bearer <token>`. Set via `extraEnv` + a K8s Secret in production. | `""` | no |
-| `WEBHOOK_BASE_URL`      | `agent.webhookBaseUrl`              | External base URL of this service, used to build the clickable `POST /approve/<id>` link in Slack HITL messages. Example: `http://kagent-healer.kagent.svc.cluster.local:8000` | `""` | no |
-| `APPROVAL_TIMEOUT_SECONDS` | —                                | Seconds the agent waits for a human to approve `cordon_node`/`drain_node` before auto-approving | `300` | no |
+**kagent healer bridge + custom MCP server** (`helm/kagent-healer/values.yaml`):
+
+| Env var                   | Helm value                        | Description                                                             | Default                                          | Required |
+|---------------------------|-----------------------------------|-------------------------------------------------------------------------|--------------------------------------------------|----------|
+| `DRY_RUN`                 | `agent.dryRun`                    | If `true`, log write actions but do not touch the cluster               | `true`                                           | no       |
+| `CONFIDENCE_THRESHOLD`    | `agent.confidenceThreshold`       | Minimum confidence for write tools to execute                           | `0.75`                                           | no       |
+| `MAX_REPLICAS`            | `agent.maxReplicas`               | Hard cap for `scale_deployment`                                         | `10`                                             | no       |
+| `DAILY_REQUEST_LIMIT`     | `agent.dailyRequestLimit`         | Max forwarded alerts per UTC day (kagent budget guard)                  | `200`                                            | no       |
+| `MEMORY_DB_PATH`          | `agent.memoryDbPath`              | SQLite file for the incident memory                                     | `/tmp/kagent-memory.db`                          | no       |
+| `AUDIT_LOG_PATH`          | `agent.auditLogPath`              | JSONL audit log path                                                    | `/tmp/kagent-audit.jsonl`                        | no       |
+| `LOG_LEVEL`               | `agent.logLevel`                  | Python log level                                                        | `INFO`                                           | no       |
+| `SECRETS_MANAGER_REGION`  | `agent.secretsManagerRegion`      | Region used by boto3 to load Slack webhook at startup                   | `ap-south-1`                                     | no       |
+| `SLACK_WEBHOOK_SECRET`    | `agent.slackWebhookSecret`        | Secrets Manager ID for the Slack URL                                    | `kagent/slack-webhook`                           | no       |
+| `WEBHOOK_PORT`            | `service.webhookPort`             | HTTP port for the Alertmanager bridge                                   | `8000`                                           | no       |
+| `MCP_PORT`                | `service.mcpPort`                 | FastMCP SSE port — kagent calls write tools here                        | `8080`                                           | no       |
+| `WEBHOOK_TOKEN`           | `agent.webhookToken`              | If set, `/webhook` requires `Authorization: Bearer <token>`             | `""`                                             | no       |
+| `WEBHOOK_BASE_URL`        | `agent.webhookBaseUrl`            | External base URL for clickable `/approve/<id>` links in Slack messages | `""`                                             | no       |
+| `KAGENT_CONTROLLER_URL`   | `agent.kagentControllerUrl`       | kagent controller A2A endpoint                                          | `http://kagent-controller.kagent.svc…:8083`      | no       |
+| `KAGENT_NAMESPACE`        | `agent.kagentNamespace`           | Namespace where the kagent Agent CRD is deployed                        | `kagent`                                         | no       |
+| `KAGENT_AGENT_NAME`       | `agent.kagentAgentName`           | Name of the kagent `Agent` resource to invoke                           | `healer-agent`                                   | no       |
+| `APPROVAL_TIMEOUT_SECONDS`| —                                 | Seconds to wait for human HITL approval before auto-approving           | `300`                                            | no       |
+
+**kagent ModelConfig** (`k8s/kagent/model-config.yaml`) — controls the LLM kagent uses:
+
+| Field                | Value             | Notes                                       |
+|----------------------|-------------------|---------------------------------------------|
+| `spec.provider`      | `Gemini`          | Google Gemini via direct API (not Vertex)   |
+| `spec.model`         | `gemini-2.5-flash`| Change to `gemini-2.5-pro` for more capable |
+| `spec.apiKeySecret`  | `kagent-gemini`   | K8s secret in `kagent` namespace            |
+| `spec.apiKeySecretKey`| `GOOGLE_API_KEY` | Key inside the secret                       |
 
 ---
 
-## Prometheus metrics exposed
+## Observability
 
-The agent serves metrics on `:8001` (scraped by the `ServiceMonitor`).
+The healer pod (bridge + custom MCP server) does **not** expose a standalone
+Prometheus metrics endpoint. Observability comes from three sources:
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `kagent_alerts_total` | Counter | `severity` | Alerts received through the webhook |
-| `kagent_gemini_calls_total` | Counter | — | Total Gemini API calls |
-| `kagent_actions_total` | Counter | `action`, `executed` | Healing actions attempted |
-| `kagent_healing_seconds` | Histogram | — | End-to-end alert→resolution latency |
-| `kagent_last_confidence` | Gauge | — | Confidence score from the last Gemini response |
-| `kagent_requests_remaining` | Gauge | — | Remaining Gemini budget for the current UTC day |
+| Source | What it covers | How to access |
+|--------|----------------|---------------|
+| **kagent controller** | Agent run counts, tool call latency, LLM token usage | `kubectl get --raw /metrics` on the controller pod; kagent UI at `:8083` |
+| **Loki / Promtail** | All structured log lines from the healer pod (bridge + MCP server) | Grafana → Explore → Loki → `{app="kagent-healer"}` |
+| **Grafana dashboard** | Pre-built panels: healing events log, pod restart trends, alert firing history | `http://localhost:3000` after `make port-forward` |
 
-The Grafana dashboard surfaces all of these including a budget-remaining stat
-with colour thresholds (red < 10, yellow < 50, green ≥ 50).
+The Grafana dashboard ConfigMap at `k8s/monitoring/grafana-dashboard-configmap.yaml`
+auto-provisions the dashboard via the Grafana sidecar — no manual import needed.
 
 ---
 
@@ -799,14 +870,13 @@ Prometheus but never reaches the agent.
 
 ### Built-in self-monitoring rules
 
-Three rules in `alert-rules.yaml` watch the agent itself (note `kagent: "false"` —
+Two rules in `alert-rules.yaml` watch the agent itself (note `kagent: "false"` —
 they fire to your normal alerting channel, not back into the healer):
 
 | Alert | Condition | Severity |
 |-------|-----------|----------|
-| `KAgentDown` | Agent unreachable for 2m (`up{job="kagent-healer"} == 0`) | critical |
-| `KAgentBudgetNearExhaustion` | < 20 Gemini requests remaining today | warning |
-| `KAgentHighStageErrorRate` | > 0.5 stage errors/min over 5m | warning |
+| `KAgentDown` | Healer health endpoint unreachable for 2m (`up{job="kagent-healer"} == 0`) | critical |
+| `KAgentHealerMCPUnreachable` | Healer container not-ready for 2m — kagent cannot call write tools | warning |
 
 ---
 
@@ -976,19 +1046,25 @@ kubectl describe pod -n kagent kagent-healer-6d8f9b7c4-xk2pv
 kubectl logs -n kagent kagent-healer-6d8f9b7c4-xk2pv --previous
 ```
 
-Most common cause is a missing or unreadable Gemini API key — the agent fails
-at startup when boto3 cannot fetch the secret.
+Most common cause is a Secrets Manager access failure — the healer pod loads
+the Slack webhook URL from Secrets Manager at startup via IRSA. If the IRSA
+role annotation is missing or the secret doesn't exist, the pod crashes.
 
 Fix:
 ```bash
-# Confirm the secret exists and is readable.
-aws secretsmanager get-secret-value --secret-id kagent/gemini-api-key --region ap-south-1
-
 # Confirm the ServiceAccount is annotated with the IRSA role ARN.
-kubectl get sa -n kagent kagent-healer -o yaml | grep eks.amazonaws.com/role-arn
+kubectl get sa -n default kagent-healer -o yaml | grep eks.amazonaws.com/role-arn
 
-# If missing, re-run the helm upgrade with --set serviceAccount.annotations...
+# Confirm IRSA role can read the secret.
+aws secretsmanager get-secret-value --secret-id kagent/slack-webhook --region ap-south-1
+
+# If the Slack secret isn't needed, set agent.slackWebhookSecret="" in Helm values.
+# The pod still starts even when the secret is missing — check exact error in logs above.
 ```
+
+> **Note:** The Gemini API key is managed entirely by kagent (via the `ModelConfig`
+> CRD and the `kagent-gemini` K8s secret). A bad Gemini key causes errors in the
+> kagent controller logs, not in the healer pod.
 
 **Success indicator:** `kubectl get pods -n kagent` shows `1/1 Running`.
 
@@ -1015,20 +1091,24 @@ prometheus-stack release was installed with
 
 Symptom: Agent logs show `action=notify_only` over and over.
 
-Diagnosis: Gemini's MCP tools are probably returning empty logs / events because
-the pod was already deleted by the time the tool was called.
+Diagnosis: kagent's built-in K8s tools are probably returning empty logs or
+events because the pod was already deleted before the tool ran. Verify by
+checking what kagent-tool-server actually returned:
 
 ```bash
-POD=$(kubectl get pod -n kagent -l app.kubernetes.io/name=kagent-healer -o jsonpath='{.items[0].metadata.name}')
-kubectl exec -n kagent "$POD" -- python -c "
-from agent import mcp_server
-print(mcp_server.get_pod_logs('default', 'crash-test-abc'))
-print(mcp_server.get_pod_events('default', 'crash-test-abc'))
-"
+# Check the kagent controller logs for tool call results
+kubectl logs -n kagent -l app.kubernetes.io/name=kagent -f | grep -i "tool"
+
+# Manually test kagent's built-in log fetch against the target pod
+kubectl logs -n default <pod-name> --tail=50
+
+# If the pod was already deleted, increase `for:` in alert-rules.yaml so alerts
+# fire sooner, giving the agent more time to gather evidence.
 ```
 
 Fix: lower `CONFIDENCE_THRESHOLD` cautiously (e.g. `0.65`) only if you've
-verified that the context is rich enough.
+verified that the context is rich enough. Alternatively, increase the alert
+`for:` duration so the pod is still alive when kagent's tools run.
 
 ### 4. PVC stuck in `Pending` — no `StorageClass`
 
@@ -1072,18 +1152,31 @@ Likely cause #3: the daily budget is exhausted — log line
 
 ### 7. Gemini API key is invalid
 
-Symptom: agent log shows
-`Gemini call failed: 400 INVALID_ARGUMENT API key not valid`.
+Symptom: kagent controller log shows
+`Error calling Gemini API: 400 INVALID_ARGUMENT API key not valid`.
+The error appears in the **kagent namespace**, not in the healer pod.
 
-Fix:
+```bash
+# Check kagent controller logs for Gemini errors
+kubectl logs -n kagent -l app.kubernetes.io/name=kagent --tail=100 | grep -i "gemini\|error"
+```
+
+Fix: the Gemini key is stored in the `kagent-gemini` K8s secret in the `kagent`
+namespace (referenced by the `ModelConfig` CRD). Rotate it there:
+
 ```bash
 # Verify the key by hand
-curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=YOUR_KEY" | jq '.error // .models[0].name'
+curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=YOUR_KEY" \
+  | jq '.error // .models[0].name'
 
-# Then rotate (Step 6) and restart the agent
-aws secretsmanager put-secret-value --secret-id kagent/gemini-api-key \
-  --secret-string "new-key" --region ap-south-1
-kubectl rollout restart deployment/kagent-healer -n kagent
+# Update the K8s secret
+kubectl create secret generic kagent-gemini \
+  -n kagent \
+  --from-literal GOOGLE_API_KEY="new-valid-key" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Restart kagent controller to pick up the new secret
+kubectl rollout restart deployment/kagent -n kagent
 ```
 
 ### 8. ECR push denied — `no basic auth credentials`

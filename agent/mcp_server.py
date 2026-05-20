@@ -1,8 +1,13 @@
-"""MCP-native Kubernetes toolbox for the KAgent self-healing agent.
+"""Custom MCP server for safety-gated Kubernetes write tools.
 
-All external I/O lives here: Kubernetes reads/writes, SQLite, Slack, CloudWatch.
-Gemini calls these tools via ALL_DECLARATIONS. Safety gates are enforced inside
-each write tool — not in pipeline or gemini code.
+Exposes healing write tools (restart, scale, cordon, drain), incident memory
+(recall_past_cases, record_outcome), and HITL approval to the kagent framework.
+
+Read tools (pod logs, events, describe) are provided by kagent's built-in
+kagent-tool-server and are NOT duplicated here.
+
+Run standalone:  python -m agent.mcp_server
+kagent reaches this server via the RemoteMCPServer CRD (SSE transport, port 8080).
 """
 
 from __future__ import annotations
@@ -41,7 +46,7 @@ except ImportError:
 try:
     from mcp.server.fastmcp import FastMCP  # type: ignore[import-untyped]
 
-    mcp: Any = FastMCP("kagent-k8s-tools")
+    mcp: Any = FastMCP("kagent-healer-tools")
     _HAS_MCP = True
 except Exception:
     mcp = None
@@ -50,7 +55,7 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Environment constants (re-read in init() to pick up late env changes)
+# Safety constants (re-read in init() to pick up late env changes)
 # ---------------------------------------------------------------------------
 
 CONFIDENCE_THRESHOLD: float = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.75"))
@@ -91,13 +96,11 @@ _scale_lock: threading.Lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
-# ApprovalStore
+# ApprovalStore — thread-safe HITL approval registry
 # ---------------------------------------------------------------------------
 
 
 class ApprovalStore:
-    """Thread-safe store of pending HITL approvals."""
-
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._pending: dict[str, threading.Event] = {}
@@ -214,167 +217,12 @@ def _dry_run_gate(action: str, target: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Read tools
+# Memory tool
 # ---------------------------------------------------------------------------
 
 
-def get_pod_logs(namespace: str, pod: str) -> str:
-    if _core is None:
-        return "Unavailable: Kubernetes client not initialised"
-    try:
-        logs = _core.read_namespaced_pod_log(
-            name=pod, namespace=namespace, tail_lines=50, previous=True
-        )
-        return f"[previous]\n{logs}"
-    except Exception:
-        pass
-    try:
-        logs = _core.read_namespaced_pod_log(
-            name=pod, namespace=namespace, tail_lines=50, previous=False
-        )
-        return f"[current]\n{logs}"
-    except Exception as exc:
-        return f"Unavailable: no logs ({exc})"
-
-
-def get_pod_events(namespace: str, pod: str) -> str:
-    if _core is None:
-        return "Unavailable: Kubernetes client not initialised"
-    try:
-        resp = _core.list_namespaced_event(
-            namespace=namespace,
-            field_selector=f"involvedObject.name={pod}",
-        )
-        events = sorted(
-            resp.items,
-            key=lambda e: str(e.last_timestamp or ""),
-            reverse=True,
-        )
-        result = [
-            {
-                "type": ev.type,
-                "reason": ev.reason,
-                "message": ev.message,
-                "count": ev.count,
-                "last_timestamp": str(ev.last_timestamp),
-            }
-            for ev in events[:10]
-        ]
-        return json.dumps(result, indent=2) if result else "No events found."
-    except Exception as exc:
-        return f"Unavailable: {exc}"
-
-
-def describe_pod(namespace: str, pod: str) -> str:
-    if _core is None:
-        return "Unavailable: Kubernetes client not initialised"
-    try:
-        p = _core.read_namespaced_pod(name=pod, namespace=namespace)
-        spec = p.spec
-        status = p.status
-        containers = []
-        for c in spec.containers or []:
-            res = c.resources or type("R", (), {"requests": None, "limits": None})()
-            containers.append(
-                {
-                    "name": c.name,
-                    "image": c.image,
-                    "resources": {
-                        "requests": dict(res.requests or {}),
-                        "limits": dict(res.limits or {}),
-                    },
-                }
-            )
-        container_statuses = []
-        for cs in status.container_statuses or []:
-            state: dict[str, Any] = {}
-            if cs.state:
-                if cs.state.running:
-                    state = {"running": True}
-                elif cs.state.waiting:
-                    state = {
-                        "waiting": {
-                            "reason": cs.state.waiting.reason,
-                            "message": cs.state.waiting.message,
-                        }
-                    }
-                elif cs.state.terminated:
-                    state = {
-                        "terminated": {
-                            "reason": cs.state.terminated.reason,
-                            "exit_code": cs.state.terminated.exit_code,
-                        }
-                    }
-            container_statuses.append(
-                {
-                    "name": cs.name,
-                    "ready": cs.ready,
-                    "restartCount": cs.restart_count,
-                    "state": state,
-                }
-            )
-        return json.dumps(
-            {
-                "phase": status.phase,
-                "node": spec.node_name,
-                "containers": containers,
-                "containerStatuses": container_statuses,
-            },
-            indent=2,
-        )
-    except Exception as exc:
-        return f"Unavailable: {exc}"
-
-
-def get_node_conditions(node_name: str) -> str:
-    if _core is None:
-        return "Unavailable: Kubernetes client not initialised"
-    try:
-        node = _core.read_node(name=node_name)
-        conditions = [
-            {
-                "type": cond.type,
-                "status": cond.status,
-                "reason": cond.reason,
-                "message": cond.message,
-            }
-            for cond in (node.status.conditions or [])
-        ]
-        return json.dumps(conditions, indent=2)
-    except Exception as exc:
-        return f"Unavailable: {exc}"
-
-
-def resolve_deployment(namespace: str, pod: str) -> str:
-    if _core is None or _apps is None:
-        return "Could not resolve deployment"
-    try:
-        p = _core.read_namespaced_pod(name=pod, namespace=namespace)
-        rs_name = next(
-            (
-                ref.name
-                for ref in (p.metadata.owner_references or [])
-                if ref.kind == "ReplicaSet"
-            ),
-            None,
-        )
-        if not rs_name:
-            return "Could not resolve deployment"
-        rs = _apps.read_namespaced_replica_set(name=rs_name, namespace=namespace)
-        deploy_name = next(
-            (
-                ref.name
-                for ref in (rs.metadata.owner_references or [])
-                if ref.kind == "Deployment"
-            ),
-            None,
-        )
-        return deploy_name if deploy_name else "Could not resolve deployment"
-    except Exception:
-        return "Could not resolve deployment"
-
-
 def recall_past_cases(alert_type: str) -> str:
+    """Retrieve the 3 most recent incident records for an alert type from SQLite memory."""
     try:
         with _db_lock:
             con = sqlite3.connect(_db_path)
@@ -399,13 +247,14 @@ def recall_past_cases(alert_type: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Write tools (each enforces confidence → namespace → dry-run gates)
+# Write tools — confidence → namespace → dry-run gates enforced first
 # ---------------------------------------------------------------------------
 
 
 def restart_deployment(
     namespace: str, deployment: str, confidence: float, reason: str
 ) -> str:
+    """Rolling restart a Deployment by patching the restartedAt annotation."""
     if msg := _confidence_gate(confidence):
         return msg
     if msg := _namespace_gate(namespace):
@@ -441,6 +290,7 @@ def scale_deployment(
     reason: str,
     alert_key: str = "",
 ) -> str:
+    """Scale a Deployment up by 1 replica. Records original count for auto-restore on resolve."""
     if msg := _confidence_gate(confidence):
         return msg
     if msg := _namespace_gate(namespace):
@@ -472,6 +322,7 @@ def scale_deployment(
 
 
 def cordon_node(node_name: str, confidence: float, reason: str) -> str:
+    """Mark a node unschedulable. Sends Slack HITL request and waits for approval."""
     if msg := _confidence_gate(confidence):
         return msg
     if msg := _dry_run_gate("cordon_node", node_name):
@@ -503,6 +354,7 @@ def cordon_node(node_name: str, confidence: float, reason: str) -> str:
 
 
 def drain_node(node_name: str, confidence: float, reason: str) -> str:
+    """Cordon and evict all non-DaemonSet pods from a node. Requires HITL approval."""
     if msg := _confidence_gate(confidence):
         return msg
     if msg := _dry_run_gate("drain_node", node_name):
@@ -594,7 +446,7 @@ def _evict_pod(namespace: str, pod: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# record_outcome — always the last tool Gemini calls
+# record_outcome — final tool kagent calls after every investigation
 # ---------------------------------------------------------------------------
 
 
@@ -611,6 +463,7 @@ def record_outcome(
     outcome: str,
     dry_run: bool,
 ) -> str:
+    """Record investigation outcome: audit JSONL, Slack, CloudWatch, SQLite."""
     timestamp = datetime.now(UTC).isoformat()
 
     # 1. Audit JSONL
@@ -694,7 +547,7 @@ def _post_slack(text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# scale_down_if_resolved — called directly by pipeline.run(), not a Gemini tool
+# scale_down_if_resolved — called by bridge.py on resolved alerts, not a kagent tool
 # ---------------------------------------------------------------------------
 
 
@@ -737,298 +590,21 @@ def scale_down_if_resolved(alert_key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# call_tool — in-process dispatch for GeminiClient
-# ---------------------------------------------------------------------------
-
-_DISPATCH: dict[str, Any] = {
-    "get_pod_logs": get_pod_logs,
-    "get_pod_events": get_pod_events,
-    "describe_pod": describe_pod,
-    "get_node_conditions": get_node_conditions,
-    "resolve_deployment": resolve_deployment,
-    "recall_past_cases": recall_past_cases,
-    "restart_deployment": restart_deployment,
-    "scale_deployment": scale_deployment,
-    "cordon_node": cordon_node,
-    "drain_node": drain_node,
-    "record_outcome": record_outcome,
-}
-
-
-def call_tool(name: str, args: dict) -> str:
-    fn = _DISPATCH.get(name)
-    if fn is None:
-        return f"Unknown tool: {name}"
-    try:
-        return str(fn(**args))
-    except Exception as exc:
-        return f"Tool error ({name}): {exc}"
-
-
-# ---------------------------------------------------------------------------
-# ALL_DECLARATIONS — Gemini function-calling format
-# ---------------------------------------------------------------------------
-
-ALL_DECLARATIONS: list[dict] = [
-    {
-        "name": "get_pod_logs",
-        "description": (
-            "Fetch the last 50 lines of pod logs. Tries previous=True first "
-            "(crash-loop case), falls back to current. Returns [previous] or [current] label."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "namespace": {"type": "string", "description": "Kubernetes namespace"},
-                "pod": {"type": "string", "description": "Pod name"},
-            },
-            "required": ["namespace", "pod"],
-        },
-    },
-    {
-        "name": "get_pod_events",
-        "description": "List the 10 most recent events for a pod, sorted newest-first.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "namespace": {"type": "string", "description": "Kubernetes namespace"},
-                "pod": {"type": "string", "description": "Pod name"},
-            },
-            "required": ["namespace", "pod"],
-        },
-    },
-    {
-        "name": "describe_pod",
-        "description": "Return pod phase, node, container specs, and container statuses as JSON.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "namespace": {"type": "string", "description": "Kubernetes namespace"},
-                "pod": {"type": "string", "description": "Pod name"},
-            },
-            "required": ["namespace", "pod"],
-        },
-    },
-    {
-        "name": "get_node_conditions",
-        "description": "Return all node conditions (Ready, MemoryPressure, DiskPressure, etc.) as JSON.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "node_name": {"type": "string", "description": "Kubernetes node name"},
-            },
-            "required": ["node_name"],
-        },
-    },
-    {
-        "name": "resolve_deployment",
-        "description": "Walk Pod→ReplicaSet→Deployment ownerReferences and return the Deployment name.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "namespace": {"type": "string", "description": "Kubernetes namespace"},
-                "pod": {"type": "string", "description": "Pod name"},
-            },
-            "required": ["namespace", "pod"],
-        },
-    },
-    {
-        "name": "recall_past_cases",
-        "description": "Retrieve the 3 most recent incident records for an alert type from SQLite memory.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "alert_type": {
-                    "type": "string",
-                    "description": "Alert name, e.g. PodCrashLooping",
-                },
-            },
-            "required": ["alert_type"],
-        },
-    },
-    {
-        "name": "restart_deployment",
-        "description": (
-            "Rolling restart a Deployment by patching the restartedAt annotation. "
-            "Enforces confidence, protected-namespace, and dry-run gates."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "namespace": {"type": "string", "description": "Kubernetes namespace"},
-                "deployment": {
-                    "type": "string",
-                    "description": "Deployment name (NOT pod name)",
-                },
-                "confidence": {
-                    "type": "number",
-                    "description": "Diagnosis confidence 0.0–1.0",
-                },
-                "reason": {"type": "string", "description": "Human-readable reason"},
-            },
-            "required": ["namespace", "deployment", "confidence", "reason"],
-        },
-    },
-    {
-        "name": "scale_deployment",
-        "description": (
-            "Scale a Deployment up by 1 replica (ceiling: MAX_REPLICAS). "
-            "Records original count for auto-scale-down on alert resolve."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "namespace": {"type": "string", "description": "Kubernetes namespace"},
-                "deployment": {"type": "string", "description": "Deployment name"},
-                "confidence": {
-                    "type": "number",
-                    "description": "Diagnosis confidence 0.0–1.0",
-                },
-                "reason": {"type": "string", "description": "Human-readable reason"},
-                "alert_key": {
-                    "type": "string",
-                    "description": "Alert key for scale-down tracking (optional)",
-                },
-            },
-            "required": ["namespace", "deployment", "confidence", "reason"],
-        },
-    },
-    {
-        "name": "cordon_node",
-        "description": (
-            "Mark a node as unschedulable. Requires HITL approval via Slack "
-            "(auto-approves after APPROVAL_TIMEOUT_SECONDS)."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "node_name": {"type": "string", "description": "Kubernetes node name"},
-                "confidence": {
-                    "type": "number",
-                    "description": "Diagnosis confidence 0.0–1.0",
-                },
-                "reason": {"type": "string", "description": "Human-readable reason"},
-            },
-            "required": ["node_name", "confidence", "reason"],
-        },
-    },
-    {
-        "name": "drain_node",
-        "description": (
-            "Cordon and evict all non-DaemonSet pods from a node. "
-            "Requires HITL approval. Retries PDB-blocked pods."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "node_name": {"type": "string", "description": "Kubernetes node name"},
-                "confidence": {
-                    "type": "number",
-                    "description": "Diagnosis confidence 0.0–1.0",
-                },
-                "reason": {"type": "string", "description": "Human-readable reason"},
-            },
-            "required": ["node_name", "confidence", "reason"],
-        },
-    },
-    {
-        "name": "record_outcome",
-        "description": (
-            "Record the final outcome of an investigation: writes audit log, "
-            "posts Slack, publishes CloudWatch metric, inserts SQLite row. "
-            "ALWAYS call this as your last tool."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "alert_key": {
-                    "type": "string",
-                    "description": "Unique alert key (alertname:namespace:pod)",
-                },
-                "alert_name": {"type": "string", "description": "Alert name"},
-                "severity": {"type": "string", "description": "Alert severity"},
-                "diagnosis": {"type": "string", "description": "Root cause diagnosis"},
-                "action": {
-                    "type": "string",
-                    "description": (
-                        "Action taken: restart_deployment, scale_deployment, "
-                        "cordon_node, drain_node, notify_only, or no_action"
-                    ),
-                },
-                "target": {
-                    "type": "string",
-                    "description": "Resource targeted (deployment or node name)",
-                },
-                "namespace": {"type": "string", "description": "Kubernetes namespace"},
-                "confidence": {
-                    "type": "number",
-                    "description": "Final confidence 0.0–1.0",
-                },
-                "executed": {
-                    "type": "boolean",
-                    "description": "Whether the healing action was actually executed",
-                },
-                "outcome": {
-                    "type": "string",
-                    "description": "Human-readable outcome description",
-                },
-                "dry_run": {
-                    "type": "boolean",
-                    "description": "Whether this was a dry-run",
-                },
-            },
-            "required": [
-                "alert_key",
-                "alert_name",
-                "severity",
-                "diagnosis",
-                "action",
-                "target",
-                "namespace",
-                "confidence",
-                "executed",
-                "outcome",
-                "dry_run",
-            ],
-        },
-    },
-]
-
-
-# ---------------------------------------------------------------------------
-# FastMCP registrations — active only when mcp package is installed
+# FastMCP tool registrations — kagent calls these via SSE on port 8080
 # ---------------------------------------------------------------------------
 
 if _HAS_MCP and mcp is not None:
 
     @mcp.tool()
-    def _mcp_get_pod_logs(namespace: str, pod: str) -> str:  # noqa: F811
-        return get_pod_logs(namespace, pod)
-
-    @mcp.tool()
-    def _mcp_get_pod_events(namespace: str, pod: str) -> str:
-        return get_pod_events(namespace, pod)
-
-    @mcp.tool()
-    def _mcp_describe_pod(namespace: str, pod: str) -> str:
-        return describe_pod(namespace, pod)
-
-    @mcp.tool()
-    def _mcp_get_node_conditions(node_name: str) -> str:
-        return get_node_conditions(node_name)
-
-    @mcp.tool()
-    def _mcp_resolve_deployment(namespace: str, pod: str) -> str:
-        return resolve_deployment(namespace, pod)
-
-    @mcp.tool()
     def _mcp_recall_past_cases(alert_type: str) -> str:
+        """Retrieve the 3 most recent incident records for this alert type."""
         return recall_past_cases(alert_type)
 
     @mcp.tool()
     def _mcp_restart_deployment(
         namespace: str, deployment: str, confidence: float, reason: str
     ) -> str:
+        """Rolling restart a Deployment. Enforces confidence, namespace, and dry-run gates."""
         return restart_deployment(namespace, deployment, confidence, reason)
 
     @mcp.tool()
@@ -1039,14 +615,17 @@ if _HAS_MCP and mcp is not None:
         reason: str,
         alert_key: str = "",
     ) -> str:
+        """Scale a Deployment up by 1 replica (max MAX_REPLICAS). Records original for auto-restore."""
         return scale_deployment(namespace, deployment, confidence, reason, alert_key)
 
     @mcp.tool()
     def _mcp_cordon_node(node_name: str, confidence: float, reason: str) -> str:
+        """Mark node unschedulable. Sends Slack HITL request; auto-approves after timeout."""
         return cordon_node(node_name, confidence, reason)
 
     @mcp.tool()
     def _mcp_drain_node(node_name: str, confidence: float, reason: str) -> str:
+        """Cordon and evict all non-DaemonSet pods. Requires HITL approval."""
         return drain_node(node_name, confidence, reason)
 
     @mcp.tool()
@@ -1063,6 +642,7 @@ if _HAS_MCP and mcp is not None:
         outcome: str,
         dry_run: bool,
     ) -> str:
+        """Record the final outcome. ALWAYS call this as your last tool."""
         return record_outcome(
             alert_key,
             alert_name,
@@ -1081,4 +661,4 @@ if _HAS_MCP and mcp is not None:
 if __name__ == "__main__":
     if not _HAS_MCP:
         raise SystemExit("mcp package not installed")
-    mcp.run()
+    mcp.run(transport="sse")

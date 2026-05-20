@@ -1,0 +1,20 @@
+# RemoteMCPServer — registers our custom healer MCP server with kagent.
+#
+# This points kagent at the safety-gated write tools running in the
+# kagent-healer pod (port 8080, FastMCP SSE transport).
+#
+# Update the URL if kagent-healer is deployed to a namespace other than 'default'.
+# Apply: kubectl apply -f k8s/kagent/remote-mcp-server.yaml
+apiVersion: kagent.dev/v1alpha2
+kind: RemoteMCPServer
+metadata:
+  name: healer-mcp-server
+  namespace: kagent
+spec:
+  description: "Safety-gated Kubernetes write tools and incident memory for the healer agent"
+  protocol: SSE
+  # Format: http://<service>.<namespace>.svc.cluster.local:<port>/sse
+  # Change 'default' to the namespace where kagent-healer Helm chart is deployed.
+  url: "http://kagent-healer.default.svc.cluster.local:8080/sse"
+  allowedNamespaces:
+    from: Same

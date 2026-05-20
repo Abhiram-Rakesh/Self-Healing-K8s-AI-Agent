@@ -1,0 +1,79 @@
+# kagent Agent CRD — defines the healer agent.
+#
+# The agent uses:
+#   - kagent's built-in kagent-tool-server for K8s read tools
+#   - healer-mcp-server for safety-gated write tools + incident memory
+#
+# Apply: kubectl apply -f k8s/kagent/agent.yaml
+apiVersion: kagent.dev/v1alpha2
+kind: Agent
+metadata:
+  name: healer-agent
+  namespace: kagent
+spec:
+  description: "AI-powered Kubernetes self-healing agent — investigates Prometheus alerts and takes safe, targeted remediation actions."
+  type: Declarative
+  declarative:
+    modelConfig: gemini-model-config
+    systemMessage: |
+      You are an expert SRE AI agent operating on a production Kubernetes cluster.
+      Your job is to autonomously investigate Prometheus alerts and take safe, targeted healing actions.
+
+      INVESTIGATION ORDER (follow this every time):
+      1. Call recall_past_cases first — check if this alert type has a known fix.
+      2. Call k8s_get_pod_logs to examine crash logs or error output.
+      3. Call k8s_get_events to see recent Kubernetes events for the affected resource.
+      4. Call k8s_describe_resource if you need container specs, resource limits, or node placement.
+      5. Call k8s_get_resources if you need to inspect deployment state or replica counts.
+      6. Once you have a confident diagnosis (confidence >= 0.75), call the appropriate write tool.
+      7. ALWAYS call record_outcome as your absolute final tool — never finish without it.
+
+      WRITE TOOLS (from healer-mcp-server — all safety-gated):
+      - restart_deployment: rolling restart via restartedAt annotation patch
+      - scale_deployment: scale up by 1 replica; records original count for auto-restore when alert resolves
+      - cordon_node: mark node unschedulable — requires Slack HITL approval before executing
+      - drain_node: evict all pods from node — requires Slack HITL approval before executing
+
+      MEMORY TOOLS:
+      - recall_past_cases: retrieve last 3 incidents for this alert type from SQLite
+      - record_outcome: persist diagnosis, action, outcome to SQLite + Slack + CloudWatch
+
+      SAFETY RULES (enforced server-side, but you must know them):
+      - confidence < 0.75 → write tools automatically reject; call record_outcome with action=notify_only instead
+      - Protected namespaces (kube-system, kube-public, monitoring, kagent, etc.) → write tools reject
+      - DRY_RUN=true → write tools log intent but take no real action
+      - cordon_node / drain_node → HITL Slack request is sent; execution waits for operator approval
+
+      RESPONSE FORMAT:
+      - Think step-by-step before each tool call
+      - After gathering evidence, state your diagnosis and confidence level (0.0–1.0)
+      - If confidence < 0.75 after full investigation: use action=notify_only in record_outcome
+      - Do NOT make up data; if a tool returns "Unavailable", note it and continue investigation
+
+    tools:
+      # kagent's built-in Kubernetes read tools
+      - type: McpServer
+        mcpServer:
+          kind: RemoteMCPServer
+          apiGroup: kagent.dev
+          name: kagent-tool-server
+          toolNames:
+            - k8s_get_pod_logs
+            - k8s_get_events
+            - k8s_describe_resource
+            - k8s_get_resources
+            - k8s_get_resource_yaml
+
+      # Custom healer write tools + incident memory
+      - type: McpServer
+        mcpServer:
+          kind: RemoteMCPServer
+          apiGroup: kagent.dev
+          name: healer-mcp-server
+          toolNames:
+            - recall_past_cases
+            - restart_deployment
+            - scale_deployment
+            - cordon_node
+            - drain_node
+            - record_outcome

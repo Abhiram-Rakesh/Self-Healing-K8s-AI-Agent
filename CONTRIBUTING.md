@@ -51,41 +51,49 @@ mock everything at the boundary.
 
 ## Adding a new healing action
 
-All healing actions are MCP tools in `agent/mcp_server.py`. Gemini decides
-which tool to call — your job is to implement the tool safely and declare it.
+**Architecture summary:** The Gemini tool-calling loop is managed entirely by
+kagent. Read tools (logs, events, describe) come from `kagent-tool-server`
+(built-in). Write tools (restart, scale, cordon, drain) live in
+`agent/mcp_server.py` and are exposed as SSE MCP tools that kagent calls.
+The system prompt lives in `k8s/kagent/agent.yaml`, not in code.
 
 1. **Add the tool function** to `agent/mcp_server.py`. Write tools must enforce
    the three safety gates in this exact order before touching the cluster:
    ```python
+   @mcp.tool()
    def my_action(namespace: str, target: str, confidence: float, reason: str) -> str:
-       if (msg := _confidence_gate(confidence)):   return msg
-       if (msg := _namespace_gate(namespace)):      return msg   # skip for node actions
+       if (msg := _confidence_gate(confidence)):      return msg
+       if (msg := _namespace_gate(namespace)):         return msg   # skip for node actions
        if (msg := _dry_run_gate("my_action", target)): return msg
        # ... actual K8s call ...
        return f"Did my_action on {target}"
    ```
 2. **For high-impact actions** (destructive or cluster-wide), add the HITL
    approval flow inside the tool — the `ApprovalStore` pattern in `cordon_node`
-   and `drain_node` is the reference implementation. The webhook server's
+   and `drain_node` is the reference implementation. The bridge's
    `POST /approve/<id>` endpoint calls `mcp_server.approval_store.approve()`
-   automatically.
+   automatically (both run in the same process).
 3. **For scale-modifying actions**, store the original replica count in
    `_scale_state[alert_key]` so `scale_down_if_resolved()` can restore it when
    the alert resolves. See `scale_deployment` for the pattern.
-4. **Register it in `_DISPATCH`** so `call_tool()` can find it:
-   ```python
-   _DISPATCH["my_action"] = my_action
+4. **Expose the tool in the Agent CRD** by adding its name to the
+   `healer-mcp-server` tool list in `k8s/kagent/agent.yaml`:
+   ```yaml
+   - type: McpServer
+     mcpServer:
+       name: healer-mcp-server
+       toolNames: [..., my_action]
    ```
-5. **Add a declaration to `ALL_DECLARATIONS`** in Gemini function-calling
-   format (JSON Schema, lowercase types). Gemini will not call the tool
-   unless it appears here.
-6. **Register with FastMCP** inside the `if _HAS_MCP and mcp is not None:` block
-   so the standalone MCP server also exposes the new tool.
-7. **Add a Prometheus alert rule** in `k8s/monitoring/alert-rules.yaml` that
+   After applying (`kubectl apply -f k8s/kagent/agent.yaml`), kagent will
+   automatically include the new tool in Gemini's tool schema.
+5. **Update the system prompt** in `k8s/kagent/agent.yaml`
+   (`spec.declarative.systemMessage`) to tell the agent when and how to use
+   the new tool.
+6. **Add a Prometheus alert rule** in `k8s/monitoring/alert-rules.yaml` that
    can trigger the new action.
-8. **Add unit tests** in `agent/tests/test_mcp_server.py` — cover at least the
+7. **Add unit tests** in `agent/tests/test_mcp_server.py` — cover at least the
    confidence gate, namespace gate, dry-run gate, and the happy path.
-9. **Update the healing actions table** in `README.md`.
+8. **Update the healing actions table** in `README.md`.
 
 ## Adding a new alert rule
 
@@ -111,7 +119,8 @@ which tool to call — your job is to implement the tool safely and declare it.
 - [ ] `DRY_RUN=true` remains the default in `helm/kagent-healer/values.yaml`
 - [ ] High-impact actions use the `ApprovalStore` HITL flow (see `cordon_node` / `drain_node`)
 - [ ] Scale-modifying actions store their pre-change state in `_scale_state` and are reversed by `scale_down_if_resolved()` on alert resolution
-- [ ] New tool is declared in `ALL_DECLARATIONS` and registered in `_DISPATCH`
+- [ ] New tool is decorated with `@mcp.tool()` and its name is added to the `healer-mcp-server` toolNames list in `k8s/kagent/agent.yaml`
+- [ ] System prompt in `k8s/kagent/agent.yaml` is updated to describe when and how the new tool should be called
 - [ ] `WEBHOOK_TOKEN` is never hardcoded — leave `agent.webhookToken` empty in `values.yaml` and inject via `extraEnv` referencing a K8s Secret in production
 
 ## Helm chart changes
@@ -129,7 +138,7 @@ Use the [Conventional Commits](https://www.conventionalcommits.org/) style:
 
 ```
 feat: add drain_node healing action
-fix: handle 429 retry in gemini tool-calling loop
+fix: respect APPROVAL_TIMEOUT_SECONDS in cordon_node
 chore: bump python:3.11-slim base image
 docs: update README with Loki install step
 ```
