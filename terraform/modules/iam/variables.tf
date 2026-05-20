@@ -16,7 +16,7 @@ variable "oidc_provider_url" {
 variable "namespace" {
   description = "Kubernetes namespace where the agent runs"
   type        = string
-  default     = "kagent"
+  default     = "default"
 }
 
 variable "service_account_name" {

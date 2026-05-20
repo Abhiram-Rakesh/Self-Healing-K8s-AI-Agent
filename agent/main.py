@@ -110,8 +110,8 @@ def main() -> int:
     # FastMCP SSE server runs in the main thread (blocking, uses asyncio internally)
     mcp_port = int(os.environ.get("MCP_PORT", "8080"))
     logger.info("Starting FastMCP SSE server on port %d", mcp_port)
-    mcp_server.mcp.settings.host = "0.0.0.0"
-    mcp_server.mcp.settings.port = mcp_port
+    mcp.settings.host = "0.0.0.0"
+    mcp.settings.port = mcp_port
     try:
         mcp.run(transport="sse")
     except KeyboardInterrupt:
