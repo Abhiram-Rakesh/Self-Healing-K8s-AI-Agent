@@ -2,8 +2,9 @@
 *           @YOUR_USERNAME
 
 # Critical paths get extra eyes.
-/agent/remediator.py            @YOUR_USERNAME
-/agent/agents/                  @YOUR_USERNAME
+/agent/mcp_server.py            @YOUR_USERNAME
+/agent/bridge.py                @YOUR_USERNAME
+/k8s/kagent/                    @YOUR_USERNAME
 /k8s/monitoring/                @YOUR_USERNAME
 /terraform/modules/iam/         @YOUR_USERNAME
 /.github/workflows/             @YOUR_USERNAME

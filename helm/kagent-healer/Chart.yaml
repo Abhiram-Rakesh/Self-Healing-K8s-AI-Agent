@@ -10,8 +10,8 @@ keywords:
   - self-healing
   - kubernetes
   - ai-agents
-home: https://github.com/Abhiram-Rakesh/Self-Healing-K8s-AI-Agent
+home: https://github.com/Abhiram-Rakesh/Self-Healing-K8s-Kagent
 sources:
-  - https://github.com/Abhiram-Rakesh/Self-Healing-K8s-AI-Agent
+  - https://github.com/Abhiram-Rakesh/Self-Healing-K8s-Kagent
 maintainers:
   - name: Self-Healing K8s KAgent Contributors

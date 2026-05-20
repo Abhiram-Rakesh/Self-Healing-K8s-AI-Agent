@@ -254,8 +254,8 @@ for a fresh dev account.
 ### Step 1 — Fork and clone the repository
 
 ```bash
-git clone https://github.com/Abhiram-Rakesh/Self-Healing-K8s-AI-Agent.git
-cd Self-Healing-K8s-AI-Agent
+git clone https://github.com/Abhiram-Rakesh/Self-Healing-K8s-Kagent.git
+cd Self-Healing-K8s-Kagent
 ```
 
 **Success indicator:** `ls` shows `Makefile`, `terraform/`, `agent/`, `helm/`,
