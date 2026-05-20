@@ -22,6 +22,8 @@ import agent.mcp_server as mcp
 @pytest.fixture(autouse=True)
 def reset_bridge_state(tmp_path):
     bridge._seen.clear()
+    bridge._cost_guard._count = 0
+    bridge._cost_guard._warned = False
     os.environ.pop("WEBHOOK_TOKEN", None)
     # Init mcp_server with mocks so scale_down_if_resolved and approval_store work
     mcp.init(
@@ -203,3 +205,32 @@ def test_approve_unknown_action_id():
     code, body = _post(srv.port, "/approve/does-not-exist", {})
     assert code == 404
     srv.stop()
+
+
+# ---------------------------------------------------------------------------
+# Budget guard
+# ---------------------------------------------------------------------------
+
+
+def test_budget_gate_blocks_when_exhausted():
+    bridge._cost_guard._limit = 1
+    bridge._cost_guard._count = 1
+    alert = {
+        "status": "firing",
+        "labels": {"alertname": "BudgetTest", "namespace": "default", "pod": "p"},
+    }
+    with patch.object(bridge, "_forward_to_kagent") as mock_fwd:
+        bridge._process_alert(alert)
+        mock_fwd.assert_not_called()
+
+
+def test_budget_gate_allows_within_limit():
+    bridge._cost_guard._limit = 200
+    bridge._cost_guard._count = 0
+    alert = {
+        "status": "firing",
+        "labels": {"alertname": "BudgetOk", "namespace": "default", "pod": "p"},
+    }
+    with patch.object(bridge, "_forward_to_kagent") as mock_fwd:
+        bridge._process_alert(alert)
+        mock_fwd.assert_called_once()

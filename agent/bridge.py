@@ -25,6 +25,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests  # type: ignore[import-untyped]
 
 from agent import mcp_server
+from agent.cost_guard import CostGuard
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,12 @@ _KAGENT_CONTROLLER_URL: str = os.environ.get(
 )
 _KAGENT_NAMESPACE: str = os.environ.get("KAGENT_NAMESPACE", "kagent")
 _KAGENT_AGENT_NAME: str = os.environ.get("KAGENT_AGENT_NAME", "healer-agent")
+
+# ---------------------------------------------------------------------------
+# Budget guard — caps forwarded alerts per UTC day (proxy for kagent/LLM calls)
+# ---------------------------------------------------------------------------
+
+_cost_guard = CostGuard()
 
 # ---------------------------------------------------------------------------
 # Deduplication
@@ -132,6 +139,9 @@ def _process_alert(alert: dict) -> None:
         return
     if _is_duplicate(key):
         logger.debug("Duplicate alert %s — dropping", key)
+        return
+    if not _cost_guard.check_and_increment():
+        logger.warning("CostGuard: daily limit reached — dropping %s", key)
         return
     _forward_to_kagent(alert)
 
