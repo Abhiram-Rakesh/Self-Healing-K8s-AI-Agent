@@ -45,11 +45,15 @@ except ImportError:
 
 try:
     from mcp.server.fastmcp import FastMCP  # type: ignore[import-untyped]
+    from mcp.server.transport_security import (  # type: ignore[import-untyped]
+        TransportSecuritySettings,
+    )
 
     mcp: Any = FastMCP(
         "kagent-healer-tools",
         host="0.0.0.0",
         port=int(os.environ.get("MCP_PORT", "8080")),
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
     _HAS_MCP = True
 except Exception:
