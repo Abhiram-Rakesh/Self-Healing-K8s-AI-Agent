@@ -46,7 +46,11 @@ except ImportError:
 try:
     from mcp.server.fastmcp import FastMCP  # type: ignore[import-untyped]
 
-    mcp: Any = FastMCP("kagent-healer-tools")
+    mcp: Any = FastMCP(
+        "kagent-healer-tools",
+        host="0.0.0.0",
+        port=int(os.environ.get("MCP_PORT", "8080")),
+    )
     _HAS_MCP = True
 except Exception:
     mcp = None
