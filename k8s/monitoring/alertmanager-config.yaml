@@ -27,7 +27,7 @@ spec:
   receivers:
     - name: kagent-webhook
       webhookConfigs:
-        - url: "http://kagent-healer.kagent.svc.cluster.local:8000/webhook"
+        - url: "http://kagent-healer.default.svc.cluster.local:8000/webhook"
           sendResolved: false
           httpConfig:
             followRedirects: true
