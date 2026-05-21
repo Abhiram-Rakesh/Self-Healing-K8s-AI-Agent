@@ -7,7 +7,7 @@ loki:
   persistence:
     enabled: true
     size: 10Gi
-    storageClassName: gp3
+    storageClassName: gp2
 
 promtail:
   enabled: true
