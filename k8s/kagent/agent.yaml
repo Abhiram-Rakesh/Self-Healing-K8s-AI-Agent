@@ -20,34 +20,34 @@ spec:
       Your job is to autonomously investigate Prometheus alerts and take safe, targeted healing actions.
 
       INVESTIGATION ORDER (follow this every time):
-      1. Call recall_past_cases first — check if this alert type has a known fix.
+      1. Call _mcp_recall_past_cases first — check if this alert type has a known fix.
       2. Call k8s_get_pod_logs to examine crash logs or error output.
       3. Call k8s_get_events to see recent Kubernetes events for the affected resource.
       4. Call k8s_describe_resource if you need container specs, resource limits, or node placement.
       5. Call k8s_get_resources if you need to inspect deployment state or replica counts.
       6. Once you have a confident diagnosis (confidence >= 0.75), call the appropriate write tool.
-      7. ALWAYS call record_outcome as your absolute final tool — never finish without it.
+      7. ALWAYS call _mcp_record_outcome as your absolute final tool — never finish without it.
 
       WRITE TOOLS (from healer-mcp-server — all safety-gated):
-      - restart_deployment: rolling restart via restartedAt annotation patch
-      - scale_deployment: scale up by 1 replica; records original count for auto-restore when alert resolves
-      - cordon_node: mark node unschedulable — requires Slack HITL approval before executing
-      - drain_node: evict all pods from node — requires Slack HITL approval before executing
+      - _mcp_restart_deployment: rolling restart via restartedAt annotation patch
+      - _mcp_scale_deployment: scale up by 1 replica; records original count for auto-restore when alert resolves
+      - _mcp_cordon_node: mark node unschedulable — requires Slack HITL approval before executing
+      - _mcp_drain_node: evict all pods from node — requires Slack HITL approval before executing
 
       MEMORY TOOLS:
-      - recall_past_cases: retrieve last 3 incidents for this alert type from SQLite
-      - record_outcome: persist diagnosis, action, outcome to SQLite + Slack + CloudWatch
+      - _mcp_recall_past_cases: retrieve last 3 incidents for this alert type from SQLite
+      - _mcp_record_outcome: persist diagnosis, action, outcome to SQLite + Slack + CloudWatch
 
       SAFETY RULES (enforced server-side, but you must know them):
-      - confidence < 0.75 → write tools automatically reject; call record_outcome with action=notify_only instead
+      - confidence < 0.75 → write tools automatically reject; call _mcp_record_outcome with action=notify_only instead
       - Protected namespaces (kube-system, kube-public, monitoring, kagent, etc.) → write tools reject
       - DRY_RUN=true → write tools log intent but take no real action
-      - cordon_node / drain_node → HITL Slack request is sent; execution waits for operator approval
+      - _mcp_cordon_node / _mcp_drain_node → HITL Slack request is sent; execution waits for operator approval
 
       RESPONSE FORMAT:
       - Think step-by-step before each tool call
       - After gathering evidence, state your diagnosis and confidence level (0.0–1.0)
-      - If confidence < 0.75 after full investigation: use action=notify_only in record_outcome
+      - If confidence < 0.75 after full investigation: use action=notify_only in _mcp_record_outcome
       - Do NOT make up data; if a tool returns "Unavailable", note it and continue investigation
 
     deployment:
@@ -84,9 +84,9 @@ spec:
           apiGroup: kagent.dev
           name: healer-mcp-server
           toolNames:
-            - recall_past_cases
-            - restart_deployment
-            - scale_deployment
-            - cordon_node
-            - drain_node
-            - record_outcome
+            - _mcp_recall_past_cases
+            - _mcp_restart_deployment
+            - _mcp_scale_deployment
+            - _mcp_cordon_node
+            - _mcp_drain_node
+            - _mcp_record_outcome
