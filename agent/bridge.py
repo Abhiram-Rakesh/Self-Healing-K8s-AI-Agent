@@ -149,13 +149,13 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 
 
 class _Handler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
+    def do_GET(self) -> None:  # noqa: N802
         if self.path in ("/health", "/healthz", "/readyz"):
             self._respond(200, {"status": "ok", "version": "2.0.0"})
         else:
             self._respond(404, {"error": "not found"})
 
-    def do_POST(self) -> None:
+    def do_POST(self) -> None:  # noqa: N802
         if self.path == "/webhook":
             self._handle_webhook()
         elif self.path.startswith("/approve/"):

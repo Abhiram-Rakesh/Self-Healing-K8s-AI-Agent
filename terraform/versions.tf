@@ -14,9 +14,9 @@ terraform {
 
   backend "s3" {
     # bucket / region passed via `terraform init -backend-config=...`
-    key            = "self-healing-k8s/terraform.tfstate"
-    encrypt        = true
-    use_lockfile   = true
+    key          = "self-healing-k8s/terraform.tfstate"
+    encrypt      = true
+    use_lockfile = true
   }
 }
 
