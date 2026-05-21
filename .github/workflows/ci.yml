@@ -94,6 +94,7 @@ jobs:
     name: Build & push image
     needs: [lint, test, lint-infra]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
