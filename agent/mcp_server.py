@@ -53,7 +53,9 @@ try:
         "kagent-healer-tools",
         host="0.0.0.0",
         port=int(os.environ.get("MCP_PORT", "8080")),
-        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=False
+        ),
     )
     _HAS_MCP = True
 except Exception:
