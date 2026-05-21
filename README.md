@@ -673,6 +673,7 @@ kagent-healer-6d8f9b7c4-xk2pv     1/1     Running   0          45s
 Verify the health endpoint via port-forward:
 ```bash
 kubectl port-forward svc/kagent-healer 8000:8000 &
+sleep 2
 curl http://localhost:8000/health
 kill %1 2>/dev/null
 ```
@@ -969,6 +970,7 @@ the Slack message. Via port-forward:
 
 ```bash
 kubectl -n kagent port-forward svc/kagent-healer 8000:8000 &
+sleep 2
 curl -X POST http://localhost:8000/approve/<action_id>
 # {"approved":"<action_id>"}
 kill %1 2>/dev/null
