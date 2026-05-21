@@ -694,6 +694,8 @@ Once the healer service is up, apply the kagent resource definitions. The
 ```bash
 kubectl apply -f k8s/kagent/model-config.yaml
 kubectl apply -f k8s/kagent/remote-mcp-server.yaml
+# Apply the ConfigMap BEFORE the Agent CRD (the Agent CRD mounts it)
+kubectl apply -f k8s/kagent/agent-patch-configmap.yaml
 kubectl apply -f k8s/kagent/agent.yaml
 ```
 

@@ -50,6 +50,19 @@ spec:
       - If confidence < 0.75 after full investigation: use action=notify_only in record_outcome
       - Do NOT make up data; if a tool returns "Unavailable", note it and continue investigation
 
+    deployment:
+      env:
+        - name: PYTHONPATH
+          value: /kagent-patch
+      volumes:
+        - name: kagent-patch
+          configMap:
+            name: healer-agent-patch
+      volumeMounts:
+        - name: kagent-patch
+          mountPath: /kagent-patch
+          readOnly: true
+
     tools:
       # kagent's built-in Kubernetes read tools
       - type: McpServer

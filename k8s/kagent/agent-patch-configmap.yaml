@@ -1,0 +1,70 @@
+# ConfigMap that provides /kagent-patch/sitecustomize.py to the healer-agent pod.
+#
+# Fixes kagent v0.9.4 SessionNotFoundError: the A2A request converter generates
+# user_id='A2A_USER_{contextId}' but the kagent controller always creates sessions
+# with user_id='admin@kagent.dev', causing every A2A invocation to fail with a 404.
+#
+# The sitecustomize.py installs a Python meta_path hook at process startup (via
+# PYTHONPATH=/kagent-patch set in spec.declarative.deployment.env in agent.yaml).
+# The hook intercepts the import of both request_converter modules and replaces
+# _get_user_id to always return 'admin@kagent.dev'.
+#
+# Apply before agent.yaml: kubectl apply -f k8s/kagent/agent-patch-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: healer-agent-patch
+  namespace: kagent
+data:
+  sitecustomize.py: |
+    """sitecustomize: Fix kagent v0.9.4 SessionNotFoundError.
+
+    Monkey-patches _get_user_id in both A2A request_converter modules so they
+    return 'admin@kagent.dev' instead of 'A2A_USER_<contextId>'. kagent controller
+    always creates sessions with user_id='admin@kagent.dev'; converters must match.
+
+    Uses a modern (Python 3.12+) find_spec + exec_module meta_path hook so the
+    patch fires at converter import time -- safely after site-packages are added
+    to sys.path by site.py.
+    """
+    import importlib.abc
+    import importlib.util
+    import sys as _sys
+
+    _TARGETS = frozenset([
+        "kagent.adk.converters.request_converter",
+        "google.adk.a2a.converters.request_converter",
+    ])
+
+
+    class _PatchingLoader(importlib.abc.Loader):
+        def __init__(self, real_loader):
+            self._real = real_loader
+
+        def create_module(self, spec):
+            if hasattr(self._real, "create_module"):
+                return self._real.create_module(spec)
+            return None
+
+        def exec_module(self, module):
+            if hasattr(self._real, "exec_module"):
+                self._real.exec_module(module)
+            module._get_user_id = lambda request: "admin@kagent.dev"
+
+
+    class _ConverterPatcher(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname not in _TARGETS or fullname in _sys.modules:
+                return None
+            _sys.meta_path.remove(self)
+            try:
+                spec = importlib.util.find_spec(fullname)
+            finally:
+                _sys.meta_path.insert(0, self)
+            if spec is None:
+                return None
+            spec.loader = _PatchingLoader(spec.loader)
+            return spec
+
+
+    _sys.meta_path.insert(0, _ConverterPatcher())
