@@ -118,7 +118,7 @@ data:
         {
           "id": 7,
           "type": "timeseries",
-          "title": "Gemini confidence over time",
+          "title": "Claude confidence over time",
           "gridPos": {"h": 8, "w": 24, "x": 0, "y": 12},
           "datasource": {"type": "prometheus", "uid": "${datasource}"},
           "targets": [
@@ -184,7 +184,7 @@ data:
         {
           "id": 13,
           "type": "stat",
-          "title": "Gemini budget remaining today",
+          "title": "LLM budget remaining today",
           "gridPos": {"h": 8, "w": 12, "x": 12, "y": 36},
           "datasource": {"type": "prometheus", "uid": "${datasource}"},
           "targets": [
@@ -212,7 +212,7 @@ data:
           "datasource": {"type": "loki", "uid": "${loki_datasource}"},
           "targets": [
             {
-              "expr": "{namespace=\"kagent\", app_kubernetes_io_name=\"kagent-healer\"} |= \"AUDIT\" | line_format \"{{ __line__ }}\"",
+              "expr": "{app=\"kagent-healer\", namespace=\"default\"} |= \"record_outcome\" | line_format \"{{ __line__ }}\"",
               "refId": "A"
             }
           ],
