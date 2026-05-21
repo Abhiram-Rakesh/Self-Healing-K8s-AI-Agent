@@ -185,7 +185,8 @@ def _init_db(path: str) -> None:
     with _db_lock:
         con = sqlite3.connect(path)
         try:
-            con.executescript("""
+            con.executescript(
+                """
                 CREATE TABLE IF NOT EXISTS incidents (
                     id         INTEGER PRIMARY KEY AUTOINCREMENT,
                     alert_type TEXT NOT NULL,
@@ -196,7 +197,8 @@ def _init_db(path: str) -> None:
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_alert_type ON incidents(alert_type);
-            """)
+            """
+            )
             con.commit()
         finally:
             con.close()
