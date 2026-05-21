@@ -23,7 +23,7 @@ DEMO_TIMEOUT="${DEMO_TIMEOUT:-180}"
 # Spinner that waits for a predicate to become true (or timeout).
 wait_for() {
   local description="$1" timeout="$2" check_cmd="$3"
-  local elapsed=0 chars='|/-\\' i=0
+  local elapsed=0 chars="|/-\\" i=0
   while (( elapsed < timeout )); do
     if eval "$check_cmd" >/dev/null 2>&1; then
       printf "\r%s[ ok ]%s %s (after %ds)\n" "$GREEN" "$NC" "$description" "$elapsed"

@@ -6,7 +6,7 @@ help: ## Show available targets
 
 install: ## Install Python dev dependencies
 	pip install -r agent/requirements.txt
-	pip install ruff black mypy pytest pytest-cov
+	pip install "ruff" "black==26.5.1" "mypy" "pytest" "pytest-cov"
 
 lint: ## Run all linters
 	ruff check agent/
