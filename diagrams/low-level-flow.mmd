@@ -1,77 +1,181 @@
-sequenceDiagram
-    autonumber
-    participant AM as Alertmanager
-    participant BR as Bridge (:8000)
-    participant KC as kagent Controller
-    participant AG as healer-agent (kagent)
-    participant KTS as kagent-tool-server
-    participant HMS as healer-mcp-server (:8080)
-    participant K as Kubernetes API
-    participant DB as SQLite (incidents)
-    participant SL as Slack / CloudWatch
+flowchart TB
+    %% ── External ─────────────────────────────────────────────────────────────
+    subgraph EXT["External"]
+        direction LR
+        DEV([Developer])
+        GH[GitHub\nSource Repo]
+        GHA[GitHub Actions\nCI · Lint · Test · Build]
+        ANTHROPIC([Anthropic API\nClaude Haiku])
+        SLACK([Slack\nHITL Approvals + Audit])
+    end
 
-    AM->>BR: POST /webhook {alerts:[...]}
-    BR-->>AM: 200 (async — thread spawned)
+    %% ── AWS Cloud ────────────────────────────────────────────────────────────
+    subgraph AWS["☁ AWS Cloud — ap-south-1"]
 
-    alt status == "resolved"
-        BR->>HMS: scale_down_if_resolved(alert_key) [in-process]
-        HMS->>K: patch deployment (restore original replicas)
-    else status == "firing"
-        BR->>BR: dedup check (300s TTL)
-        alt duplicate within TTL
-            BR-->>BR: drop — return
-        else new alert
-            BR->>KC: POST /api/a2a/kagent/healer-agent\n{jsonrpc, method: tasks/send, params: {message}}
-            KC->>AG: start agent run with alert prompt
+        ECR[(ECR\nkagent-healer\nimage repo)]
+        S3[(S3\nTF State Bucket\nversioned + encrypted)]
 
-            AG->>HMS: recall_past_cases(alert_type)
-            HMS->>DB: SELECT incidents WHERE alert_type=?
-            DB-->>HMS: last 3 records
-            HMS-->>AG: past case summary
+        subgraph IAM_BLOCK["IAM + OIDC"]
+            direction TB
+            OIDC[EKS OIDC\nProvider]
+            IRSA[IRSA Role\nkagent-healer-irsa\nSecretsMgr + CW + S3]
+            EBS_ROLE[EBS CSI\nIRSA Role]
+            CLUSTER_ROLE[EKS Cluster\nIAM Role]
+            NODE_ROLE[Node Group\nIAM Role\nWorkerNode+CNI+ECR+SSM]
+        end
 
-            AG->>KTS: k8s_get_pod_logs(namespace, pod)
-            KTS->>K: read pod logs
-            K-->>KTS: log lines
-            KTS-->>AG: logs
+        subgraph SM["Secrets Manager"]
+            SM_SLACK[kagent/slack-webhook]
+            SM_GEMINI[kagent/gemini-api-key\noptional]
+        end
 
-            AG->>KTS: k8s_get_events(namespace, pod)
-            KTS->>K: list events
-            K-->>KTS: events list
-            KTS-->>AG: events JSON
+        subgraph CW["CloudWatch"]
+            CW_LOGS[Log Group\n/aws/eks/self-healing-cluster]
+            CW_METRICS[Custom Metrics\nkagent namespace]
+        end
 
-            opt if more evidence needed
-                AG->>KTS: k8s_describe_resource / k8s_get_resources
-                KTS->>K: K8s API call
-                K-->>KTS: data
-                KTS-->>AG: structured result
+        %% ── VPC ──────────────────────────────────────────────────────────────
+        subgraph VPC["VPC  10.0.0.0/16"]
+
+            IGW[Internet\nGateway]
+
+            subgraph PUB["Public Subnets × 3 AZs"]
+                EIP[Elastic IP]
+                NAT[NAT Gateway]
             end
 
-            alt confidence >= 0.75 — standard write
-                Note over HMS: Safety gates inside write tool:<br/>1. confidence gate<br/>2. protected-namespace gate<br/>3. dry-run gate
-                AG->>HMS: restart_deployment / scale_deployment
-                HMS->>K: patch deployment
-                K-->>HMS: ok / api error
-                HMS-->>AG: "Restarted deployment/X" or "DRY_RUN: …"
-            else confidence >= 0.75 — HITL path (cordon/drain)
-                AG->>HMS: cordon_node / drain_node
-                HMS->>SL: Slack HITL request + /approve/<id> URL
-                alt operator approves before timeout
-                    note over BR: POST /approve/<action_id>
-                    BR->>HMS: approval_store.approve(action_id) [in-process]
-                    HMS-->>BR: event.set() → True
-                else APPROVAL_TIMEOUT_SECONDS elapsed
-                    Note over HMS: auto-approve (event.wait timeout)
+            subgraph PRIV["Private Subnets × 3 AZs"]
+
+                subgraph EKS_CP["EKS Control Plane  (AWS-managed)"]
+                    APISERVER[Kubernetes\nAPI Server]
+                    CP_SG[Control Plane\nSecurity Group]
                 end
-                HMS->>K: patch_node unschedulable + evict pods (PDB retry 5s→15s→30s)
-                K-->>HMS: ok / api error
-                HMS-->>AG: drain/cordon result
-            else confidence < 0.75
-                Note over AG: action = notify_only
-            end
 
-            AG->>HMS: record_outcome(...) — FINAL tool call
-            HMS->>DB: INSERT INTO incidents
-            HMS->>SL: POST Slack audit + CloudWatch put_metric_data
-            HMS-->>AG: "Outcome recorded for ..."
+                subgraph SYS_NG["System Node Group  t3.medium × 2  ON_DEMAND"]
+                    COREDNS[CoreDNS\naddon]
+                    KPROXY[kube-proxy\naddon]
+                    VPCCNI[vpc-cni\naddon]
+                end
+
+                subgraph WORK_NG["Workload Node Group  t3.large  ON_DEMAND + SPOT"]
+
+                    subgraph NS_MON["namespace: monitoring"]
+                        PROM[Prometheus\n:9090]
+                        AM[Alertmanager\n:9093]
+                        GRAFANA[Grafana\n:3000]
+                        LOKI[Loki\n:3100]
+                        PROMTAIL[Promtail\nDaemonSet]
+                        KSM[kube-state-\nmetrics]
+                        NE[node-exporter\nDaemonSet]
+                    end
+
+                    subgraph NS_KAGENT["namespace: kagent"]
+                        KAGENT_CTRL[kagent Controller\n:8083]
+                        HEALER_AG[healer-agent\nAgent CRD]
+                        KAGENT_TS[kagent-tool-server\nBuilt-in K8s MCP]
+                    end
+
+                    subgraph NS_DEFAULT["namespace: default"]
+                        BRIDGE[Bridge\n:8000\nAlertmanager webhook]
+                        MCP[healer-mcp-server\nFastMCP SSE :8080]
+                        SQLITE[(SQLite\nIncident Memory\n/data/kagent-memory.db)]
+                        AUDIT[(Audit Log\nJSONL\n/data/kagent-audit.jsonl)]
+                    end
+
+                    subgraph NS_LITMUS["namespace: litmus"]
+                        LITMUS[Litmus Chaos\nOperator]
+                        CHAOS_ENG[ChaosEngine CRD\npod-delete]
+                    end
+
+                    EBS_VOL[(EBS Volumes\ngp3 — dynamic PVCs\nLoki · Prometheus)]
+                end
+            end
         end
     end
+
+    %% ═══════════════════════════════════════════════════════════════════════
+    %% CONNECTIONS
+    %% ═══════════════════════════════════════════════════════════════════════
+
+    %% Developer → CI/CD
+    DEV -->|git push| GH
+    GH -->|trigger| GHA
+    GHA -->|docker buildx push| ECR
+    GHA -->|lint · test · terraform plan| S3
+
+    %% Networking spine
+    IGW --> EIP --> NAT
+    NAT -->|egress| PRIV
+
+    %% IAM wiring
+    OIDC -->|federates| IRSA
+    OIDC -->|federates| EBS_ROLE
+    CLUSTER_ROLE -->|AmazonEKSClusterPolicy| EKS_CP
+    NODE_ROLE -->|AmazonEKSWorkerNodePolicy\nAmazonEKS_CNI_Policy\nAmazonEC2ContainerRegistryReadOnly\nAmazonSSMManagedInstanceCore| SYS_NG
+    NODE_ROLE --> WORK_NG
+    EBS_ROLE -->|AmazonEBSCSIDriverPolicy| EBS_VOL
+    IRSA -->|GetSecretValue| SM_SLACK
+    IRSA -->|PutMetricData · PutLogEvents| CW_METRICS
+
+    %% Image pull
+    ECR -->|image pull on deploy| NS_DEFAULT
+
+    %% EKS control plane → CloudWatch
+    EKS_CP -->|control plane audit logs| CW_LOGS
+
+    %% Monitoring scrape
+    KSM -->|k8s object metrics| PROM
+    NE -->|node metrics| PROM
+    PROM -->|AlertmanagerConfig\nkagent:true label| AM
+    PROMTAIL -->|pod log streams| LOKI
+    GRAFANA -->|PromQL queries| PROM
+    GRAFANA -->|LogQL queries| LOKI
+
+    %% Alert → Bridge → Agent
+    AM -->|POST /webhook\nfiring alerts| BRIDGE
+    BRIDGE -->|dedup · budget guard| BRIDGE
+    BRIDGE -->|A2A v0.3.0\nPOST message/send| KAGENT_CTRL
+    KAGENT_CTRL -->|spawn agent run| HEALER_AG
+
+    %% Agent tool-calling loop
+    HEALER_AG -->|k8s_get_pod_logs\nk8s_get_events\nk8s_describe_resource\nk8s_get_resources| KAGENT_TS
+    KAGENT_TS -->|kubectl reads| APISERVER
+    HEALER_AG -->|_mcp_recall_past_cases\n_mcp_restart_deployment\n_mcp_scale_deployment\n_mcp_cordon_node\n_mcp_drain_node\n_mcp_record_outcome| MCP
+    MCP -->|safety-gated writes\nconfidence + namespace + dry-run gates| APISERVER
+    MCP <-->|SELECT / INSERT incidents| SQLITE
+    MCP -->|append JSONL| AUDIT
+
+    %% LLM
+    KAGENT_CTRL <-->|tool-calling loop\nClaude Haiku| ANTHROPIC
+
+    %% Outcomes
+    MCP -->|PutMetricData\nkagent_alerts_total etc| CW_METRICS
+    MCP -->|HITL approval request\naudit notifications| SLACK
+    BRIDGE -->|POST /approve/id\nHTLP approval relay| MCP
+
+    %% Litmus
+    LITMUS -->|executes| CHAOS_ENG
+    CHAOS_ENG -->|pod delete fault| NS_DEFAULT
+
+    %% PVC → EBS
+    LOKI -.->|PVC| EBS_VOL
+    PROM -.->|PVC| EBS_VOL
+
+    %% ── Styles ───────────────────────────────────────────────────────────────
+    classDef aws fill:#FF9900,color:#000,stroke:#c47d00
+    classDef kagent fill:#7c3aed,color:#fff,stroke:#4c1d95
+    classDef healer fill:#4f46e5,color:#fff,stroke:#312e81
+    classDef llm fill:#16a34a,color:#fff,stroke:#14532d
+    classDef store fill:#0891b2,color:#fff,stroke:#155e75
+    classDef ext fill:#374151,color:#fff,stroke:#111827
+    classDef mon fill:#b45309,color:#fff,stroke:#78350f
+    classDef chaos fill:#dc2626,color:#fff,stroke:#991b1b
+
+    class ECR,S3,IAM_BLOCK,SM,CW,VPC,IGW,NAT,EIP aws
+    class KAGENT_CTRL,HEALER_AG,KAGENT_TS kagent
+    class BRIDGE,MCP healer
+    class ANTHROPIC llm
+    class SQLITE,AUDIT,EBS_VOL store
+    class DEV,GH,GHA,SLACK ext
+    class PROM,AM,GRAFANA,LOKI,PROMTAIL,KSM,NE mon
+    class LITMUS,CHAOS_ENG chaos
