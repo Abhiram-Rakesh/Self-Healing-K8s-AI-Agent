@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # Stage 1: builder
-FROM python:3.11-slim AS builder
+FROM python:3.14-slim AS builder
 WORKDIR /app
 # hadolint ignore=DL3008
 RUN apt-get update \
@@ -11,7 +11,7 @@ COPY agent/requirements.txt .
 RUN pip install --no-cache-dir --user -r requirements.txt
 
 # Stage 2: runtime
-FROM python:3.11-slim
+FROM python:3.14-slim
 WORKDIR /app
 
 # Non-root user
