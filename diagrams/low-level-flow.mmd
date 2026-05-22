@@ -78,7 +78,8 @@ flowchart TB
                     subgraph NS_DEFAULT["namespace: default"]
                         BRIDGE[Bridge\n:8000\nAlertmanager webhook]
                         MCP[healer-mcp-server\nFastMCP SSE :8080]
-                        SQLITE[(SQLite\nIncident Memory\n/data/kagent-memory.db)]
+                        POSTGRES[(PostgreSQL\nIncident Memory\nBitnami StatefulSet :5432)]
+                        SQLITE[(SQLite\nIncident Memory\nlocal dev fallback)]
                         AUDIT[(Audit Log\nJSONL\n/data/kagent-audit.jsonl)]
                     end
 
@@ -142,7 +143,9 @@ flowchart TB
     KAGENT_TS -->|kubectl reads| APISERVER
     HEALER_AG -->|_mcp_recall_past_cases\n_mcp_restart_deployment\n_mcp_scale_deployment\n_mcp_cordon_node\n_mcp_drain_node\n_mcp_record_outcome| MCP
     MCP -->|safety-gated writes\nconfidence + namespace + dry-run gates| APISERVER
-    MCP <-->|SELECT / INSERT incidents| SQLITE
+    MCP <-->|SELECT / INSERT incidents\nDATABASE_URL set — production| POSTGRES
+    MCP <-.->|SELECT / INSERT incidents\nlocal dev fallback| SQLITE
+    POSTGRES -.->|PVC 5Gi gp3| EBS_VOL
     MCP -->|append JSONL| AUDIT
 
     %% LLM
@@ -175,7 +178,7 @@ flowchart TB
     class KAGENT_CTRL,HEALER_AG,KAGENT_TS kagent
     class BRIDGE,MCP healer
     class ANTHROPIC llm
-    class SQLITE,AUDIT,EBS_VOL store
+    class SQLITE,AUDIT,EBS_VOL,POSTGRES store
     class DEV,GH,GHA,SLACK ext
     class PROM,AM,GRAFANA,LOKI,PROMTAIL,KSM,NE mon
     class LITMUS,CHAOS_ENG chaos
