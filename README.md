@@ -16,22 +16,9 @@ CRD. The default configuration uses **Claude Haiku** (fast, cost-effective); a
 
 ## Architecture diagram
 
-```mermaid
-flowchart LR
-    subgraph K8s["AWS EKS Cluster"]
-        P[Workload Pods] -->|metrics| PR[Prometheus]
-        PR -->|alerts fire| AM[Alertmanager]
-        AM -->|webhook POST /webhook| BR[kagent-healer\nBridge :8000]
-        BR -->|A2A message/send| AG[healer-agent\nAgent :8080]
-        AG -->|read tools: logs / events / describe| KTS[kagent-tool-server\nBuilt-in K8s MCP]
-        AG -->|write tools: restart / scale / cordon / drain| HMS[healer-mcp-server\nCustom MCP :8080]
-        KTS --> K8sAPI[Kubernetes API]
-        HMS -->|safety-gated writes| K8sAPI
-    end
-    AG -->|Claude / Gemini / OpenAI| G[(LLM API)]
-    HMS -->|record_outcome: audit + notify| CW[CloudWatch + Slack]
-    HMS -->|recall / record_outcome| MEM[(PostgreSQL / SQLite memory)]
-```
+
+![Architecture Diagram](diagrams/Self-Healing-K8s-KAgent.png)
+
 
 ---
 
