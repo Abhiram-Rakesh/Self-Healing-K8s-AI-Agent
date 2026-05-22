@@ -6,7 +6,7 @@ need to get from a fresh clone to an open PR.
 ## Getting started
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/self-healing-k8s-kagent.git
+git clone https://github.com/Abhiram-Rakesh/Self-Healing-K8s-Kagent.git
 cd self-healing-k8s-kagent
 
 # Install Python runtime + dev tools

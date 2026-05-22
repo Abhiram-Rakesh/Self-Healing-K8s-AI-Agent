@@ -16,7 +16,6 @@ CRD. The default configuration uses **Claude Haiku** (fast, cost-effective); a
 
 ## Architecture diagram
 
-
 ![Architecture Diagram](diagrams/Self-Healing-K8s-KAgent.png)
 
 
@@ -360,7 +359,7 @@ Open `terraform/terraform.tfvars` and set these values:
 | `workload_node_count`| `2`                                      | Two = the minimum for HPA experiments                    |
 | `enable_ha_nat`      | `false`                                  | `true` = one NAT GW per AZ (~3x the cost)                |
 | `state_bucket`       | `my-name-tf-state-123456789012`          | The bucket you created in Step 2                         |
-| `llm_api_key`     | from your LLM provider         | Store in Secrets Manager |
+| `gemini_api_key`  | your Gemini API key (optional) | Only needed if using Gemini — leave blank when using Anthropic (Claude) |
 | `slack_webhook_url`  | optional `https://hooks.slack.com/...`   | Leave empty to disable Slack notifications               |
 
 Initialize, plan, apply:
