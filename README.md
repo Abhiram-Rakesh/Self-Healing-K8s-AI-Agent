@@ -30,7 +30,7 @@ flowchart LR
     end
     AG -->|Claude / Gemini / OpenAI| G[(LLM API)]
     HMS -->|record_outcome: audit + notify| CW[CloudWatch + Slack]
-    HMS -->|recall / record_outcome| MEM[(SQLite memory)]
+    HMS -->|recall / record_outcome| MEM[(PostgreSQL / SQLite memory)]
 ```
 
 ---
@@ -45,9 +45,9 @@ flowchart LR
 | Chaos            | Litmus ChaosCenter               | Repeatable failure injection                                  |
 | AI               | Anthropic Claude / Google Gemini (pluggable) | LLM — driven by kagent's tool-calling loop; default: Claude Haiku |
 | Agent framework  | [kagent](https://kagent.dev) (CNCF sandbox) | Manages Agent CRD, LLM loop, built-in K8s MCP tools |
-| Custom MCP server| Python 3.11 + FastMCP            | Safety-gated write tools, HITL approval, SQLite memory        |
+| Custom MCP server| Python 3.11 + FastMCP            | Safety-gated write tools, HITL approval, incident memory      |
 | Bridge           | Python 3.11 (stdlib HTTP server) | Thin Alertmanager→kagent forwarder with dedup                 |
-| Memory           | SQLite (stdlib)                  | Past incident store — no external DB needed                   |
+| Memory           | PostgreSQL (Bitnami Helm dep) / SQLite fallback | Incident store — PostgreSQL enables HPA; SQLite for local dev |
 | Packaging        | Docker (multi-stage, non-root, amd64+arm64) | Reproducible agent image, runs on Graviton nodes     |
 | Deployment       | Helm v3                          | Templated K8s install of the agent                            |
 | CI/CD            | GitHub Actions + OIDC            | Lint, test, build, push, tag, terraform plan/apply            |

@@ -45,6 +45,22 @@ agent:
   kagentNamespace: "kagent"
   kagentAgentName: "healer-agent"
 
+# PostgreSQL sub-chart (Bitnami). When enabled, incident memory is stored in
+# PostgreSQL and DATABASE_URL is injected automatically. This unblocks HPA/KEDA.
+# Run `helm dependency update helm/kagent-healer` before the first install.
+postgresql:
+  enabled: false
+  auth:
+    database: kagent_memory
+    username: kagent
+    password: ""          # set via --set or existingSecret; leave blank to auto-generate
+  primary:
+    persistence:
+      size: 1Gi
+      storageClass: ""
+
+# SQLite PVC fallback — only used when postgresql.enabled=false.
+# Does NOT support replicaCount > 1 (RWO, single-writer).
 persistence:
   enabled: false
   size: 1Gi

@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Prometheus + Alertmanager** — fires alerts on cluster health anomalies
 - **Thin bridge** (Python, :8000) — receives Alertmanager webhooks, deduplicates, forwards to kagent
 - **Custom MCP server** (Python 3.11 + FastMCP, :8080) — exposes safety-gated write tools and incident memory
-- **SQLite** — persists incident history for context recall
+- **PostgreSQL** (Bitnami Helm dep, production) / **SQLite** (local dev fallback) — persists incident history for context recall; PostgreSQL enables HPA/KEDA
 - **Helm + Terraform** — reproducible infra provisioning on AWS EKS
 
 ## Architecture
@@ -26,7 +26,7 @@ Prometheus → Alertmanager → Bridge (:8000) → kagent Agent (A2A v0.3.0)
                               ↓                                ↓
                          Kubernetes API          ┌─────────────┴──────────────┐
                                                   ↓                            ↓
-                                           SQLite memory            Safety gates + Slack HITL
+                                    PostgreSQL / SQLite memory       Safety gates + Slack HITL
 ```
 
 ### Key Components
@@ -43,7 +43,8 @@ Prometheus → Alertmanager → Bridge (:8000) → kagent Agent (A2A v0.3.0)
 - FastMCP SSE server on `:8080` — kagent calls write tools here
 - Write tools enforce three safety gates (in order): confidence threshold → protected namespace → dry-run
 - Write tools: `restart_deployment`, `scale_deployment`, `cordon_node`, `drain_node`
-- Memory tools: `recall_past_cases` (SQLite), `record_outcome` (SQLite + Slack + CloudWatch)
+- Memory tools: `recall_past_cases` (PostgreSQL or SQLite), `record_outcome` (PostgreSQL or SQLite + Slack + CloudWatch)
+- DB backend selected at runtime: `DATABASE_URL` env set → PostgreSQL (psycopg2); unset → SQLite fallback
 - `ApprovalStore` — thread-safe registry for HITL approval of high-impact actions
 - `_scale_state` — tracks original replica counts for auto-restore when alerts resolve
 
@@ -132,7 +133,8 @@ For full deployment instructions, see `README.md` Steps 1–10 (prerequisites, T
 | `CONFIDENCE_THRESHOLD` | `0.75` | Helm/env | Min confidence for write tools |
 | `MAX_REPLICAS` | `10` | Helm/env | Hard cap for `scale_deployment` |
 | `DAILY_REQUEST_LIMIT` | `200` | Helm/env | Daily LLM call budget (alerts forwarded per UTC day) |
-| `MEMORY_DB_PATH` | `/tmp/kagent-memory.db` | Helm/env | SQLite incident store |
+| `DATABASE_URL` | `""` | Helm/env (Secret) | PostgreSQL DSN (`postgresql://user:pass@host:5432/db`); if set, SQLite is bypassed |
+| `MEMORY_DB_PATH` | `/tmp/kagent-memory.db` | Helm/env | SQLite incident store path (ignored when `DATABASE_URL` is set) |
 | `AUDIT_LOG_PATH` | `/tmp/kagent-audit.jsonl` | Helm/env | JSONL audit log |
 | `LOG_LEVEL` | `INFO` | Helm/env | Python log level |
 | `WEBHOOK_PORT` | `8000` | Helm/env | Bridge HTTP port |
@@ -145,8 +147,14 @@ For full deployment instructions, see `README.md` Steps 1–10 (prerequisites, T
 | `SLACK_WEBHOOK_SECRET` | `kagent/slack-webhook` | Helm/env | Secrets Manager secret ID for Slack URL |
 
 ### Helm Values
-Main chart: `helm/kagent-healer/values.yaml` (dev default, no persistence)
-Production overlay: `helm/kagent-healer/values-prod.yaml` (persistence, HPA, PDB, NetworkPolicy, higher confidence threshold)
+Main chart: `helm/kagent-healer/values.yaml` (dev default — SQLite on `/tmp`, `postgresql.enabled=false`)
+Production overlay: `helm/kagent-healer/values-prod.yaml` (PostgreSQL enabled, HPA enabled, PDB, NetworkPolicy, higher confidence threshold)
+
+Before deploying with `postgresql.enabled=true`, run:
+```bash
+helm dependency update helm/kagent-healer/
+kubectl create secret generic kagent-pg-secret --from-literal=password=<strong-password>
+```
 
 ## Healing Actions Reference
 

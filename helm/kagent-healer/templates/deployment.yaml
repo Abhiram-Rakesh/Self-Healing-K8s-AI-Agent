@@ -41,10 +41,23 @@ spec:
           envFrom:
             - configMapRef:
                 name: {{ include "kagent-healer.fullname" . }}-config
-          {{- with .Values.extraEnv }}
           env:
+            {{- if .Values.postgresql.enabled }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  {{- if .Values.postgresql.auth.existingSecret }}
+                  name: {{ .Values.postgresql.auth.existingSecret }}
+                  {{- else }}
+                  name: {{ include "kagent-healer.fullname" . }}-postgresql
+                  {{- end }}
+                  key: {{ .Values.postgresql.auth.secretKeys.userPasswordKey | default "password" }}
+            - name: DATABASE_URL
+              value: "postgresql://{{ .Values.postgresql.auth.username }}:$(PGPASSWORD)@{{ include "kagent-healer.fullname" . }}-postgresql:5432/{{ .Values.postgresql.auth.database }}"
+            {{- end }}
+            {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
-          {{- end }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /health

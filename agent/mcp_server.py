@@ -23,6 +23,13 @@ from datetime import UTC, datetime
 from typing import Any
 
 try:
+    import psycopg2  # type: ignore[import-untyped]
+
+    _HAS_PSYCOPG2 = True
+except ImportError:
+    _HAS_PSYCOPG2 = False
+
+try:
     import requests  # type: ignore[import-untyped]
 
     _HAS_REQUESTS = True
@@ -96,6 +103,7 @@ PROTECTED_NAMESPACES: frozenset[str] = frozenset(
 _core: Any = None
 _apps: Any = None
 _db_path: str = "/tmp/kagent-memory.db"
+_pg_dsn: str = ""
 _audit_path: str = "/tmp/kagent-audit.jsonl"
 _slack_url: str = ""
 _cw_client: Any = None
@@ -154,12 +162,13 @@ def init(
     slack_url: str,
     aws_region: str,
 ) -> None:
-    global _core, _apps, _db_path, _audit_path, _slack_url, _cw_client
+    global _core, _apps, _db_path, _pg_dsn, _audit_path, _slack_url, _cw_client
     global CONFIDENCE_THRESHOLD, MAX_REPLICAS, DRY_RUN, APPROVAL_TIMEOUT_SECONDS, WEBHOOK_BASE_URL
 
     _core = core_api
     _apps = apps_api
     _db_path = db_path
+    _pg_dsn = os.environ.get("DATABASE_URL", "")
     _audit_path = audit_path
     _slack_url = slack_url
 
@@ -172,7 +181,7 @@ def init(
     try:
         _init_db(db_path)
     except Exception as exc:
-        logger.error("SQLite init failed: %s", exc)
+        logger.error("DB init failed: %s", exc)
 
     if os.environ.get("KUBERNETES_SERVICE_HOST") and _HAS_BOTO3:
         try:
@@ -182,6 +191,39 @@ def init(
 
 
 def _init_db(path: str) -> None:
+    if _pg_dsn:
+        _init_db_pg()
+    else:
+        _init_db_sqlite(path)
+
+
+def _init_db_pg() -> None:
+    with _db_lock:
+        con = psycopg2.connect(_pg_dsn)
+        try:
+            with con.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS incidents (
+                        id         SERIAL PRIMARY KEY,
+                        alert_type TEXT NOT NULL,
+                        diagnosis  TEXT NOT NULL,
+                        action     TEXT NOT NULL,
+                        outcome    TEXT NOT NULL,
+                        confidence REAL NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_alert_type ON incidents(alert_type)"
+                )
+            con.commit()
+        finally:
+            con.close()
+
+
+def _init_db_sqlite(path: str) -> None:
     with _db_lock:
         con = sqlite3.connect(path)
         try:
@@ -234,18 +276,31 @@ def _dry_run_gate(action: str, target: str) -> str | None:
 
 
 def recall_past_cases(alert_type: str) -> str:
-    """Retrieve the 3 most recent incident records for an alert type from SQLite memory."""
+    """Retrieve the 3 most recent incident records for an alert type from incident memory."""
     try:
         with _db_lock:
-            con = sqlite3.connect(_db_path)
-            try:
-                rows = con.execute(
-                    "SELECT diagnosis, action, outcome, confidence, created_at "
-                    "FROM incidents WHERE alert_type = ? ORDER BY id DESC LIMIT 3",
-                    (alert_type,),
-                ).fetchall()
-            finally:
-                con.close()
+            if _pg_dsn:
+                con = psycopg2.connect(_pg_dsn)
+                try:
+                    with con.cursor() as cur:
+                        cur.execute(
+                            "SELECT diagnosis, action, outcome, confidence, created_at "
+                            "FROM incidents WHERE alert_type = %s ORDER BY id DESC LIMIT 3",
+                            (alert_type,),
+                        )
+                        rows = cur.fetchall()
+                finally:
+                    con.close()
+            else:
+                con = sqlite3.connect(_db_path)
+                try:
+                    rows = con.execute(
+                        "SELECT diagnosis, action, outcome, confidence, created_at "
+                        "FROM incidents WHERE alert_type = ? ORDER BY id DESC LIMIT 3",
+                        (alert_type,),
+                    ).fetchall()
+                finally:
+                    con.close()
         if not rows:
             return "No past cases."
         lines = [
@@ -532,22 +587,43 @@ def record_outcome(
         except Exception as exc:
             logger.error("CloudWatch put_metric_data failed: %s", exc)
 
-    # 4. SQLite
+    # 4. Incident memory (PostgreSQL or SQLite)
     try:
         with _db_lock:
-            con = sqlite3.connect(_db_path)
-            try:
-                con.execute(
-                    "INSERT INTO incidents "
-                    "(alert_type, diagnosis, action, outcome, confidence, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (alert_name, diagnosis, action, outcome, confidence, timestamp),
-                )
-                con.commit()
-            finally:
-                con.close()
+            if _pg_dsn:
+                con = psycopg2.connect(_pg_dsn)
+                try:
+                    with con.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO incidents "
+                            "(alert_type, diagnosis, action, outcome, confidence, created_at) "
+                            "VALUES (%s, %s, %s, %s, %s, %s)",
+                            (
+                                alert_name,
+                                diagnosis,
+                                action,
+                                outcome,
+                                confidence,
+                                timestamp,
+                            ),
+                        )
+                    con.commit()
+                finally:
+                    con.close()
+            else:
+                con = sqlite3.connect(_db_path)
+                try:
+                    con.execute(
+                        "INSERT INTO incidents "
+                        "(alert_type, diagnosis, action, outcome, confidence, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (alert_name, diagnosis, action, outcome, confidence, timestamp),
+                    )
+                    con.commit()
+                finally:
+                    con.close()
     except Exception as exc:
-        logger.error("SQLite insert failed: %s", exc)
+        logger.error("DB insert failed: %s", exc)
 
     return f"Outcome recorded for {alert_key}"
 

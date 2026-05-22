@@ -12,7 +12,8 @@ data:
   MAX_REPLICAS: {{ .Values.agent.maxReplicas | quote }}
   DAILY_REQUEST_LIMIT: {{ .Values.agent.dailyRequestLimit | quote }}
 
-  # Storage
+  # Storage — DATABASE_URL is injected via env secretKeyRef when postgresql.enabled;
+  # MEMORY_DB_PATH is unused in that mode but kept for the SQLite fallback path.
   {{- if .Values.persistence.enabled }}
   MEMORY_DB_PATH: "/data/kagent-memory.db"
   AUDIT_LOG_PATH: "/data/kagent-audit.jsonl"

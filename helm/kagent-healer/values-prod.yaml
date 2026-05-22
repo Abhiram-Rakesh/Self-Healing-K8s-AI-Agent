@@ -1,15 +1,29 @@
 # Production overrides. Apply with:
 #   helm upgrade --install kagent-healer helm/kagent-healer/ -f values-prod.yaml ...
+#
+# Prerequisites:
+#   1. helm dependency update helm/kagent-healer/
+#   2. kubectl create secret generic kagent-pg-secret \
+#        --from-literal=password=<strong-password>
 
-# SQLite does not support concurrent writes from multiple pods sharing the same
-# PVC. Keep replicaCount=1 and hpa.enabled=false while persistence is enabled.
-# To run multiple replicas, replace RunbookMemory with a shared database backend
-# and set persistence.enabled=false.
-replicaCount: 1
+replicaCount: 2
 
-persistence:
+# PostgreSQL handles concurrent connections — multiple replicas are safe.
+postgresql:
   enabled: true
-  size: 2Gi
+  auth:
+    database: kagent_memory
+    username: kagent
+    existingSecret: kagent-pg-secret
+    secretKeys:
+      userPasswordKey: password
+  primary:
+    persistence:
+      size: 5Gi
+
+# SQLite PVC disabled — PostgreSQL is the memory backend in production.
+persistence:
+  enabled: false
 
 image:
   pullPolicy: IfNotPresent
@@ -30,7 +44,10 @@ resources:
     memory: 768Mi
 
 hpa:
-  enabled: false  # disabled — see replicaCount note above
+  enabled: true   # safe — PostgreSQL handles concurrent connections from multiple replicas
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
 
 podDisruptionBudget:
   enabled: true
