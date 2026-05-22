@@ -22,6 +22,46 @@ CRD. The default configuration uses **Claude Haiku** (fast, cost-effective); a
 
 ---
 
+## Screenshots
+
+Prometheus detects a pod stuck in `CrashLoopBackOff` and fires a `PodCrashLooping` alert, tagged `kagent=true` to route it to the agent.
+
+![Prometheus Alert Pending](screenshots/prometheus-alert-pending.png)
+
+The raw `kube_pod_container_status_waiting_reason` metric confirms multiple crash-looping pods tracked over time.
+
+![Prometheus CrashLoop Metric](screenshots/prometheus-crashloop-metric.png)
+
+The bridge forwards the firing alert to the kagent agent, which immediately calls `recall_past_cases` to check incident memory for prior context.
+
+![Agent Alert Received](screenshots/agent-alert-received-recall-past-cases.png)
+
+The agent correlates logs, events, and resource state to identify the root cause — an intentional `exit 1` in the container entrypoint — with supporting evidence.
+
+![Agent Root Cause Analysis](screenshots/agent-root-cause-analysis.png)
+
+With confidence at 0.95, the agent calls `restart_deployment` on the `crash-test` deployment, passing the safety gates (confidence → namespace → dry-run).
+
+![Agent Restart Deployment](screenshots/agent-restart-deployment-action.png)
+
+The agent surfaces a structured healing summary: alert, root cause, evidence, action taken, and expected outcome — all in one response.
+
+![Agent Healing Summary](screenshots/agent-healing-summary.png)
+
+Node Exporter dashboard confirms cluster nodes are healthy throughout — CPU, memory, and disk staying within normal bounds.
+
+![Grafana Node Exporter](screenshots/grafana-node-exporter.png)
+
+Kubernetes namespace resource view shows the kagent-healer pod running at minimal CPU while crash-test pods cycle through remediation.
+
+![Grafana K8s Namespace Pods](screenshots/grafana-k8s-namespace-pods.png)
+
+LitmusChaos validates the full loop end-to-end: the `pod-delete` chaos experiment completed with `Verdict: Pass` and 100% probe success.
+
+![Chaos Result Pass](screenshots/chaos-result-pass.png)
+
+---
+
 ## Tech stack
 
 | Layer            | Technology                       | Purpose                                                       |
